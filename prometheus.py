@@ -2669,7 +2669,7 @@ Please repair and return ONLY valid JSON that conforms to the schema. No explana
             except SyntaxError as e:
                 return {"is_valid": False, "feedback": f"Syntax error: {e}"}
 
-        if dev_strategy == DevelopmentStrategy.TDD.value or tests_override is not None or acceptance_criteria:
+        if dev_strategy == DevelopmentStrategy.TDD.value or tests_override is not None:
             # Generate and run tests (or use provided tests for strict TDD)
             test_code = tests_override or await self._generate_tests(
                 code,
@@ -2678,13 +2678,13 @@ Please repair and return ONLY valid JSON that conforms to the schema. No explana
                 module_name=module_name,
             )
             coverage_report = self._run_tests_and_coverage(test_code, code, language)
-            if (
-                coverage_report["coverage"]
-                < config.strategy_configs[dev_strategy]["test_coverage_threshold"]
-            ):
+            # Use TDD config threshold regardless of dev_strategy label
+            tdd_cfg = config.strategy_configs.get(DevelopmentStrategy.TDD.value, {})
+            cov_threshold = float(tdd_cfg.get("test_coverage_threshold", 0.80))
+            if coverage_report["coverage"] < cov_threshold:
                 return {
                     "is_valid": False,
-                    "feedback": f"Coverage {coverage_report['coverage']:.2%} < {config.strategy_configs[dev_strategy]['test_coverage_threshold']:.2%}",
+                    "feedback": f"Coverage {coverage_report['coverage']:.2%} < {cov_threshold:.2%}",
                 }
             if coverage_report["failing_tests"]:
                 return {
@@ -2759,19 +2759,24 @@ Please repair and return ONLY valid JSON that conforms to the schema. No explana
         test_path = temp_dir / "test_file.py"
         source_path = temp_dir / "source.py"
 
+        # Ensure tests can import the source module
+        test_prelude = (
+            "import sys, pathlib\n"
+            "sys.path.insert(0, str(pathlib.Path(__file__).parent))\n"
+            "import source\n\n"
+        )
         with open(test_path, "w") as f:
-            f.write(test_code)
+            f.write(test_prelude + test_code)
         with open(source_path, "w") as f:
             f.write(source_code)
 
         try:
             # Measure coverage on the temporary source file only
-            cov = coverage.Coverage(
-                source=[str(source_path.parent)], include=[str(source_path)], omit=[]
-            )
+            cov = coverage.Coverage(source=[str(temp_dir)], branch=True)
             cov.start()
             result = subprocess.run(
-                ["pytest", str(test_path), "-v", "--tb=short"],
+                ["pytest", str(test_path.name), "-v", "--tb=short"],
+                cwd=str(temp_dir),
                 capture_output=True,
                 text=True,
             )
