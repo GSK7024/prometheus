@@ -2523,6 +2523,72 @@ Please repair and return ONLY valid JSON that conforms to the schema. No explana
         # The code cleaning might be less necessary if the prompt is very strict, but it's a good safeguard.
         return self._clean_code(raw_code, language=file_blueprint.language)
 
+    async def code_reviewer(
+        self,
+        code: str,
+        file_name: str,
+        acceptance_criteria: Optional[List[str]] = None,
+        cognitive_state: Dict = None,
+        dev_strategy: str = None,
+    ) -> str:
+        """Provide a diff-style review patch for the given code."""
+        criteria_text = (
+            "\n\nAcceptance criteria to verify:\n- "
+            + "\n- ".join(acceptance_criteria)
+            if acceptance_criteria
+            else ""
+        )
+        prompt = (
+            f"You are a meticulous senior code reviewer. File: {file_name}.\n"
+            f"Review the code below and propose a minimal unified diff patch (no explanations) that:\n"
+            f"- Fixes bugs, improves readability, and adheres to Python best practices\n"
+            f"- Preserves public API unless clearly wrong\n"
+            f"- Improves testability and error handling{criteria_text}\n\n"
+            f"Return ONLY a unified diff starting with '---' and '+++' lines.\n\n"
+            f"CODE:\n{code}"
+        )
+        return await self._make_api_call(prompt, "Reviewer", cognitive_state=cognitive_state, dev_strategy=dev_strategy)
+
+    async def code_judge(
+        self,
+        original_code: str,
+        proposed_patch: str,
+        file_name: str,
+        acceptance_criteria: Optional[List[str]] = None,
+        cognitive_state: Dict = None,
+        dev_strategy: str = None,
+    ) -> Dict:
+        """Score proposed patch; return {'accept': bool, 'score': float, 'rationale': str}."""
+        criteria_text = (
+            "\n\nAcceptance criteria:\n- "
+            + "\n- ".join(acceptance_criteria)
+            if acceptance_criteria
+            else ""
+        )
+        schema = {
+            "type": "object",
+            "properties": {
+                "accept": {"type": "boolean"},
+                "score": {"type": "number"},
+                "rationale": {"type": "string"},
+            },
+            "required": ["accept", "score", "rationale"],
+        }
+        prompt = (
+            f"You are a strict judge. Evaluate a proposed unified diff patch for {file_name}.\n"
+            f"Consider correctness, readability, safety, testability, and adherence to acceptance criteria.{criteria_text}\n"
+            f"Return JSON with accept (bool), score (0-1), rationale (short).\n\n"
+            f"ORIGINAL CODE:\n{original_code}\n\nPATCH:\n{proposed_patch}"
+        )
+        return await self._get_structured_output(
+            prompt,
+            "Judge",
+            {"accept": False, "score": 0.0, "rationale": "default"},
+            schema=schema,
+            cognitive_state=cognitive_state,
+            dev_strategy=dev_strategy,
+        )
+
     async def code_validator(
         self,
         code: str,
@@ -2680,6 +2746,12 @@ Please repair and return ONLY valid JSON that conforms to the schema. No explana
             proc = subprocess.run(cmd, capture_output=True, text=True)
             if proc.returncode != 0:
                 issues += proc.stderr.count("error") + proc.stdout.count("error")
+        # Add mypy strict type check for python
+        if language == "python":
+            proc = subprocess.run([sys.executable, "-m", "mypy", str(temp_file)], capture_output=True, text=True)
+            if proc.returncode != 0:
+                # count errors by lines
+                issues += len([l for l in proc.stdout.splitlines() if ": error:" in l])
         try:
             temp_file.unlink()
         except Exception:
@@ -4394,6 +4466,32 @@ class UltraCognitiveForgeOrchestrator:
                             if re.search(patt, generated_code):
                                 logger.error(f"Diff guard blocked change for {target_file}: pattern {patt}")
                                 return False, f"Diff guard blocked change for security pattern: {patt}"
+                    # Reviewer/Judge loop to further refine
+                    try:
+                        review_patch = await self.ai.code_reviewer(
+                            generated_code,
+                            target_file,
+                            task.get("details", {}).get("acceptance_criteria", []),
+                            self.project_state.cognitive_state,
+                            dev_strategy,
+                        )
+                        if review_patch.strip().startswith("---"):
+                            judge_result = await self.ai.code_judge(
+                                generated_code,
+                                review_patch,
+                                target_file,
+                                task.get("details", {}).get("acceptance_criteria", []),
+                                self.project_state.cognitive_state,
+                                dev_strategy,
+                            )
+                            if judge_result.get("accept") and judge_result.get("score", 0) >= 0.6:
+                                try:
+                                    refined = self._apply_unified_diff(generated_code, review_patch)
+                                    generated_code = refined
+                                except Exception as e:
+                                    logger.warning(f"Failed to apply review patch: {e}")
+                    except Exception as e:
+                        logger.warning(f"Reviewer/Judge loop skipped due to error: {e}")
                     logger.info(f"Code for {target_file} passed validation.")
                     self.assembler.add_file(target_file, generated_code)
                     self.assembler.write_files_to_disk()
@@ -4433,6 +4531,28 @@ class UltraCognitiveForgeOrchestrator:
             False,
             f"Failed to generate valid code for {target_file} after {config.max_debug_attempts} attempts.",
         )
+
+    def _apply_unified_diff(self, original: str, patch_text: str) -> str:
+        """Apply a minimal unified diff to a single-file string.
+
+        Limitations: best-effort small diffs; falls back to original on failure.
+        """
+        try:
+            lines = patch_text.splitlines()
+            add_lines = [l[1:] for l in lines if l.startswith('+') and not l.startswith('+++')]
+            remove_lines = [l[1:] for l in lines if l.startswith('-') and not l.startswith('---')]
+            src_lines = original.splitlines()
+            result = src_lines[:]
+            for rl in remove_lines:
+                try:
+                    idx = result.index(rl)
+                    result.pop(idx)
+                except ValueError:
+                    pass
+            result.extend(add_lines)
+            return "\n".join(result)
+        except Exception:
+            return original
 
     async def execute_tool_task(self, details: dict) -> Tuple[bool, str]:
         """Executes a tool based on the provided details."""
@@ -4807,6 +4927,12 @@ class CognitiveFileAssembler:
             path = Path(sandbox_path) / filename
             create_dir_safely(str(path.parent))
             try:
+                # Secret scanning using diff guard patterns before write
+                if getattr(config, "enable_diff_guard", False):
+                    for patt in config.forbidden_diff_patterns:
+                        if re.search(patt, content):
+                            logger.error(f"Secret/scary pattern detected in {filename}: {patt}")
+                            continue
                 with open(path, "w", encoding="utf-8") as f:
                     f.write(content)
             except Exception as e:
