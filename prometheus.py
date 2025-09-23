@@ -507,6 +507,10 @@ class Config:
             },
         }
 
+        # Performance toggles
+        # Skip per-file detailed blueprints and go straight to code generation
+        self.skip_detailed_blueprints = True
+
         # Language configs with enhanced TDD support
         self.language_configs["python"]["test_command"] = (
             "pytest --cov=src --cov-report=term-missing -v --tb=short"  # Enhanced with coverage
@@ -3669,39 +3673,51 @@ class UltraCognitiveForgeOrchestrator:
                 f"Architect identified {len(files_to_blueprint)} files to create."
             )
 
-            # Step 3b & 3c: Loop and generate detailed blueprint for each file, then assemble
+            # Step 3b & 3c: Optionally skip per-file detailed blueprints for speed
             all_file_blueprints = []
-            filenames = [f["filename"] for f in files_to_blueprint]
-
-            for file_info in files_to_blueprint:
-                filename = file_info["filename"]
-                logger.info(f"Generating detailed blueprint for: {filename}...")
-                file_blueprint_dict = await self.ai.cognitive_architect(
-                    query_text,
-                    constraints,
-                    past_projects,
-                    self.project_state.cognitive_state,
-                    self.project_state.development_strategy,
-                    file_to_blueprint=filename,
-                    existing_files=filenames,
-                )
-
-                file_blueprint = FileBlueprint.from_dict(file_blueprint_dict)
-                if file_blueprint:
-                    all_file_blueprints.append(file_blueprint)
-                else:
-                    logger.warning(
-                        f"Failed to generate a valid blueprint for {filename}. Using synthesized fallback blueprint."
+            if getattr(config, "skip_detailed_blueprints", False):
+                logger.info("Skipping detailed per-file blueprints; creating thin blueprints for speed.")
+                for file_info in files_to_blueprint:
+                    all_file_blueprints.append(
+                        FileBlueprint(
+                            filename=file_info["filename"],
+                            description=file_info.get("description", "Auto-generated file"),
+                            classes=[],
+                            functions=[],
+                            language="python" if file_info["filename"].endswith(".py") else "",
+                        )
                     )
-                    synthesized = FileBlueprint(
-                        filename=filename,
-                        description=file_info.get(
-                            "description", "Auto-synthesized file"
-                        ),
-                        classes=[],
-                        functions=[],
+            else:
+                filenames = [f["filename"] for f in files_to_blueprint]
+                for file_info in files_to_blueprint:
+                    filename = file_info["filename"]
+                    logger.info(f"Generating detailed blueprint for: {filename}...")
+                    file_blueprint_dict = await self.ai.cognitive_architect(
+                        query_text,
+                        constraints,
+                        past_projects,
+                        self.project_state.cognitive_state,
+                        self.project_state.development_strategy,
+                        file_to_blueprint=filename,
+                        existing_files=filenames,
                     )
-                    all_file_blueprints.append(synthesized)
+
+                    file_blueprint = FileBlueprint.from_dict(file_blueprint_dict)
+                    if file_blueprint:
+                        all_file_blueprints.append(file_blueprint)
+                    else:
+                        logger.warning(
+                            f"Failed to generate a valid blueprint for {filename}. Using synthesized fallback blueprint."
+                        )
+                        synthesized = FileBlueprint(
+                            filename=filename,
+                            description=file_info.get(
+                                "description", "Auto-synthesized file"
+                            ),
+                            classes=[],
+                            functions=[],
+                        )
+                        all_file_blueprints.append(synthesized)
 
             self.project_state.living_blueprint.root = all_file_blueprints
 
