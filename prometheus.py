@@ -493,6 +493,7 @@ class Config:
                 "sprint_duration": 14,  # Days
                 "story_points_scale": [1, 2, 3, 5, 8, 13],
                 "velocity_tracking": True,
+                "sprint_batch_size": 5,
             },
             "devops": {
                 "ci_frequency": "push",
@@ -3807,6 +3808,40 @@ class UltraCognitiveForgeOrchestrator:
         # Strategy-aware next task selection
         # Agile: pull next user story from sprint backlog and convert into a concrete dev task
         if self.project_state.development_strategy == DevelopmentStrategy.AGILE.value:
+            # If no queued tasks and sprint backlog exists, pre-enqueue a batch of tasks
+            if self.project_state.sprint_backlog and not self.project_state.task_queue:
+                batch_size = config.strategy_configs[DevelopmentStrategy.AGILE.value].get(
+                    "sprint_batch_size", 3
+                )
+                to_enqueue = self.project_state.sprint_backlog[:batch_size]
+                self.project_state.sprint_backlog = self.project_state.sprint_backlog[batch_size:]
+
+                candidate_files = [f.filename for f in self.project_state.living_blueprint.root]
+                default_target = None
+                for fname in candidate_files:
+                    if fname.endswith(".py") and not fname.startswith("tests/"):
+                        default_target = fname
+                        break
+                if not default_target:
+                    default_target = candidate_files[0] if candidate_files else "src/agent.py"
+
+                for story in to_enqueue:
+                    target_file = default_target
+                    self.project_state.task_queue.append(
+                        {
+                            "task_type": TaskType.TDD_IMPLEMENTATION.value,
+                            "task_description": f"Implement user story: {story.get('description', 'Story')} in {target_file}",
+                            "details": {
+                                "target_file": target_file,
+                                "acceptance_criteria": story.get("acceptance_criteria", []),
+                                "story_points": story.get("story_points", 1),
+                            },
+                        }
+                    )
+
+            if self.project_state.task_queue:
+                return self.project_state.task_queue.pop(0)
+
             if self.project_state.sprint_backlog:
                 story = self.project_state.sprint_backlog.pop(0)
                 # Heuristic: pick a sensible target file from blueprint
