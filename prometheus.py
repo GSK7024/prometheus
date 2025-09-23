@@ -177,14 +177,48 @@ class NeuromorphicMemory:
     ):  # Increased clusters for finer granularity
         self.memory_dim = memory_dim
         self.num_clusters = num_clusters
-        self.memory_index = faiss.IndexFlatIP(
-            memory_dim
-        )  # Changed to Inner Product for cosine similarity
+        # Use FAISS if available; otherwise fall back to a simple in-memory cosine index
+        if faiss is not None:
+            self.memory_index = faiss.IndexFlatIP(memory_dim)
+            self._uses_faiss = True
+        else:
+            self._uses_faiss = False
+            class _LocalIPIndex:
+                def __init__(self, dim: int):
+                    self.dim = dim
+                    self.vectors = []
+                def add(self, vecs):
+                    for v in vecs:
+                        self.vectors.append(v.astype(np.float32))
+                def search(self, query, k):
+                    if not self.vectors:
+                        scores = np.zeros((1, k), dtype=np.float32)
+                        indices = -np.ones((1, k), dtype=np.int64)
+                        return scores, indices
+                    mat = np.vstack(self.vectors).astype(np.float32)  # (N, D)
+                    # Normalize matrix and query for cosine similarity
+                    mat_norm = mat / (np.linalg.norm(mat, axis=1, keepdims=True) + 1e-8)
+                    q = query.astype(np.float32)
+                    q = q / (np.linalg.norm(q) + 1e-8)
+                    sims = np.dot(mat_norm, q.T).reshape(-1)  # (N,)
+                    top_k = min(k, sims.shape[0])
+                    idxs = np.argsort(-sims)[:top_k]
+                    scores = sims[idxs].astype(np.float32)
+                    # Pad to k
+                    if top_k < k:
+                        pad_scores = np.zeros(k - top_k, dtype=np.float32)
+                        pad_idxs = -np.ones(k - top_k, dtype=np.int64)
+                        scores = np.concatenate([scores, pad_scores])
+                        idxs = np.concatenate([idxs, pad_idxs])
+                    return scores.reshape(1, -1), idxs.reshape(1, -1)
+            self.memory_index = _LocalIPIndex(memory_dim)
         self.memory_data = []
         self.memory_metadata = []
         self.cluster_model = DBSCAN(
             eps=0.3, min_samples=1
         )  # Tuned for better clustering
+        # Keep a parallel store of embeddings for relevance and cluster heuristics
+        self._embedding_store = []
 
         # Lazy-loaded components with fallback
         self.cognitive_embedder = None
@@ -234,11 +268,19 @@ class NeuromorphicMemory:
         embedding = self.embed_text(str(data))
         if embedding is None:
             return
+        # Ensure embedding is float32 and normalized
+        embedding = embedding.astype(np.float32)
+        norm = float(np.linalg.norm(embedding))
+        if norm > 0:
+            embedding = embedding / norm
 
-        # Relevance check before adding
-        relevance = np.random.uniform(
-            0, 1
-        )  # Placeholder; in real, compute from context
+        # Compute relevance as similarity to existing memories (max cosine similarity)
+        relevance = 1.0
+        if self._embedding_store:
+            mat = np.vstack(self._embedding_store).astype(np.float32)  # (N, D)
+            sims = np.dot(mat, embedding.T).reshape(-1)
+            relevance = float(np.max(sims))
+        # Active forgetting of very low-relevance items
         if relevance < self.forgetting_threshold:
             logger.debug("Memory forgotten due to low relevance.")
             return
@@ -246,6 +288,8 @@ class NeuromorphicMemory:
         self.memory_index.add(embedding)
         self.memory_data.append(data)
         self.memory_metadata.append(metadata or {})
+        # Track embedding for future relevance/cluster computations
+        self._embedding_store.append(embedding.squeeze(0))
 
         # Periodic clustering with forgetting
         if len(self.memory_data) % 50 == 0:  # More frequent updates
@@ -4512,8 +4556,84 @@ class CognitiveFileAssembler:
         return total_size < config.max_project_size_gb * 1024**3
 
     def get_cognitive_patterns(self) -> Dict[str, Dict[str, int]]:
-        # Placeholder: analyze files for patterns
-        return {f: {"abstraction": 1} for f in self.files}
+        """Analyze files and extract simple cognitive/structural metrics per file."""
+        patterns: Dict[str, Dict[str, int]] = {}
+        for filename, content in self.files.items():
+            metrics: Dict[str, int] = {
+                "abstraction": 0,      # approx: number of classes
+                "modularity": 0,       # approx: classes + functions
+                "documentation": 0,    # approx: docstrings present
+                "complexity": 0,       # approx: control-flow nodes
+                "typedness": 0,        # approx: annotations count
+                "comment_density": 0,  # approx: percentage of comment lines
+            }
+
+            try:
+                if filename.endswith(".py"):
+                    tree = ast.parse(content)
+                    num_classes = sum(isinstance(n, ast.ClassDef) for n in ast.walk(tree))
+                    num_funcs = sum(isinstance(n, ast.FunctionDef) for n in ast.walk(tree))
+                    num_async = sum(isinstance(n, ast.AsyncFunctionDef) for n in ast.walk(tree))
+
+                    # Docstrings
+                    doc_count = 1 if ast.get_docstring(tree) else 0
+                    for n in ast.walk(tree):
+                        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                            if ast.get_docstring(n):
+                                doc_count += 1
+
+                    # Typedness
+                    typed_count = sum(isinstance(n, ast.AnnAssign) for n in ast.walk(tree))
+                    for n in ast.walk(tree):
+                        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                            if getattr(n, "returns", None) is not None:
+                                typed_count += 1
+                            for arg in list(getattr(n, "args", ast.arguments()).args or []):
+                                if getattr(arg, "annotation", None) is not None:
+                                    typed_count += 1
+
+                    # Complexity approximation
+                    complexity_nodes = (
+                        ast.If, ast.For, ast.While, ast.Try, ast.With, ast.BoolOp, ast.Compare
+                    )
+                    complexity = sum(isinstance(n, complexity_nodes) for n in ast.walk(tree)) + 1
+
+                    # Comments density
+                    lines = content.splitlines()
+                    total_lines = max(1, len(lines))
+                    comment_lines = sum(1 for l in lines if l.strip().startswith("#"))
+                    comment_density = int(100 * comment_lines / total_lines)
+
+                    metrics["abstraction"] = int(num_classes)
+                    metrics["modularity"] = int(num_classes + num_funcs + num_async)
+                    metrics["documentation"] = int(doc_count)
+                    metrics["complexity"] = int(complexity)
+                    metrics["typedness"] = int(typed_count)
+                    metrics["comment_density"] = int(comment_density)
+                else:
+                    # Lightweight heuristics for non-Python files
+                    lc = content.lower()
+                    num_classes = lc.count("class ")
+                    num_funcs = lc.count("function ") + lc.count("=>")
+                    control = lc.count(" if ") + lc.count(" for ") + lc.count(" while ")
+                    docs = lc.count("/**") + lc.count("///")
+                    comments = sum(1 for l in content.splitlines() if l.strip().startswith(("//", "/*", "*")))
+                    total = max(1, len(content.splitlines()))
+
+                    metrics["abstraction"] = int(num_classes)
+                    metrics["modularity"] = int(num_classes + num_funcs)
+                    metrics["documentation"] = int(docs)
+                    metrics["complexity"] = int(control + 1)
+                    metrics["typedness"] = int(lc.count(": "))  # weak proxy
+                    metrics["comment_density"] = int(100 * comments / total)
+
+            except Exception:
+                # On parse errors, keep defaults but mark with minimal signal
+                metrics.setdefault("modularity", 0)
+
+            patterns[filename] = metrics
+
+        return patterns
 
 
 # --- Main Execution with Cognitive Enhancements ---
