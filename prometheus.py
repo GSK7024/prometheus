@@ -2515,6 +2515,7 @@ Please repair and return ONLY valid JSON that conforms to the schema. No explana
         language: str,
         cognitive_state: Dict = None,
         dev_strategy: str = None,
+        tests_override: Optional[str] = None,
     ) -> Dict:
         """Enhanced validation with actual test execution for TDD."""
         validation = {"is_valid": True, "feedback": ""}
@@ -2530,8 +2531,8 @@ Please repair and return ONLY valid JSON that conforms to the schema. No explana
                 return {"is_valid": False, "feedback": f"Syntax error: {e}"}
 
         if dev_strategy == DevelopmentStrategy.TDD.value:
-            # Generate and run tests
-            test_code = await self._generate_tests(code, language)
+            # Generate and run tests (or use provided tests for strict TDD)
+            test_code = tests_override or await self._generate_tests(code, language)
             coverage_report = self._run_tests_and_coverage(test_code, code, language)
             if (
                 coverage_report["coverage"]
@@ -3775,6 +3776,31 @@ class UltraCognitiveForgeOrchestrator:
         if self.project_state.task_queue:
             return self.project_state.task_queue.pop(0)
 
+        # Strategy-aware next task selection
+        # Agile: pull next user story from sprint backlog and convert into a concrete dev task
+        if self.project_state.development_strategy == DevelopmentStrategy.AGILE.value:
+            if self.project_state.sprint_backlog:
+                story = self.project_state.sprint_backlog.pop(0)
+                # Heuristic: pick a sensible target file from blueprint
+                candidate_files = [f.filename for f in self.project_state.living_blueprint.root]
+                target_file = None
+                for fname in candidate_files:
+                    if fname.endswith(".py") and not fname.startswith("tests/"):
+                        target_file = fname
+                        break
+                if not target_file:
+                    target_file = candidate_files[0] if candidate_files else "src/agent.py"
+
+                return {
+                    "task_type": TaskType.CODE_MODIFICATION.value,
+                    "task_description": f"Implement user story: {story.get('description', 'Story')} in {target_file}",
+                    "details": {
+                        "target_file": target_file,
+                        "acceptance_criteria": story.get("acceptance_criteria", []),
+                        "story_points": story.get("story_points", 1),
+                    },
+                }
+
         # If queue is empty, ask CEO for the next task
         logger.info("Task queue is empty. Consulting CEO Strategist...")
         query_text_for_ceo = (
@@ -4167,6 +4193,23 @@ class UltraCognitiveForgeOrchestrator:
         language = file_blueprint.language
 
         feedback = None
+
+        # Strict TDD: write tests first, then implement code until tests pass
+        tests_override: Optional[str] = None
+        if dev_strategy == DevelopmentStrategy.TDD.value:
+            try:
+                logger.info(f"Generating tests first for TDD: {target_file}")
+                # Use current (possibly empty) blueprint context to author tests
+                tests_override = await self.ai._generate_tests("", language)
+                # Persist tests into the repo so they are visible and durable
+                if language == "python":
+                    module_name = Path(target_file).stem
+                    test_path = f"tests/test_{module_name}.py"
+                    self.assembler.add_file(test_path, tests_override)
+                    self.assembler.write_files_to_disk()
+            except Exception as e:
+                logger.warning(f"Failed to pre-generate tests for TDD: {e}")
+
         for attempt in range(config.max_debug_attempts):
             logger.info(f"Code generation attempt {attempt + 1} for {target_file}...")
             try:
@@ -4185,6 +4228,7 @@ class UltraCognitiveForgeOrchestrator:
                     language,
                     self.project_state.cognitive_state,
                     dev_strategy,
+                    tests_override=tests_override,
                 )
 
                 if validation_result.get("is_valid"):
@@ -4373,12 +4417,60 @@ class UltraCognitiveForgeOrchestrator:
             return False, result["message"]
 
     async def execute_cognitive_analysis_task(self, task_details: Dict) -> str:
-        # ... (implementation remains the same)
-        return "Cognitive analysis complete."
+        patterns = self.assembler.get_cognitive_patterns()
+        quality_score = self._calculate_quality_score(patterns)
+        recommendations = self._generate_cognitive_recommendations(patterns)
+        analysis = {
+            "quality": quality_score,
+            "patterns": patterns,
+            "recommendations": recommendations,
+        }
+        # Log and persist as memory for future retrieval
+        self.memory.add_memory(
+            self.goal,
+            self.project_state.living_blueprint,
+            strategy=[self.project_state.development_strategy],
+            cognitive_state=self.project_state.cognitive_state,
+            dev_strategy=self.project_state.development_strategy,
+        )
+        logger.info(f"Cognitive analysis: quality={quality_score:.2f}")
+        return json.dumps(analysis)
 
     async def execute_self_evolution_task(self, task_details: Dict) -> str:
-        # ... (implementation remains the same)
-        return "Self-evolution complete."
+        evolution_type = (task_details or {}).get("evolution_type", "cognitive")
+        # Prepare a concise context from current state
+        failure_context = task_details.get("context", "Proactive evolution") if task_details else "Proactive evolution"
+        evolution_plan = await self.ai.metamorph_architect(
+            self.project_state.goal,
+            failure_context,
+            self.project_state.cognitive_state,
+            self.project_state.development_strategy,
+        )
+
+        await self.apply_cognitive_evolution(evolution_plan)
+
+        # Optional: adjust strategy dynamically
+        if evolution_type == "cognitive":
+            self.project_state.cognitive_state["current_mode"] = CognitiveState.EVOLUTIONARY.value
+        elif evolution_type == "capability":
+            # Trigger a blueprint refresh for a randomly chosen file
+            if self.project_state.living_blueprint.root:
+                target = random.choice(self.project_state.living_blueprint.root).filename
+                self.project_state.task_queue.insert(
+                    0,
+                    {
+                        "task_type": TaskType.BLUEPRINT_FILE.value,
+                        "task_description": f"Refresh blueprint for {target}",
+                        "details": {"target_file": target},
+                    },
+                )
+
+        # Persist and optionally commit
+        await self.save_state()
+        if self.project_state.development_strategy == DevelopmentStrategy.DEVOPS.value:
+            await self._commit_and_push()
+
+        return "Self-evolution applied and state updated."
 
     async def handle_task_failure(self, task_response: dict, error_result: str):
         """Handle task failure with cognitive recovery strategies"""
