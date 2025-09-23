@@ -519,6 +519,8 @@ class Config:
             r"rm\s+-rf\s+/",  # dangerous destructive command
             r"curl\s+http[s]?://[^\s]+\s*\|\s*sh",  # curl pipe to shell
         ]
+        # Personas
+        self.max_personas = 1000
 
         # Language configs with enhanced TDD support
         self.language_configs["python"]["test_command"] = (
@@ -1741,6 +1743,53 @@ class QuantumCognitiveAI:
             f"Initialized with model provider '{self.llm_choice}', default model '{self.current_model}'"
         )
 
+    # --- Meta-Persona Orchestrator ---
+    def _synthesize_personas(self, phase: str) -> List[Dict[str, Any]]:
+        """Create a pool of up to config.max_personas lightweight persona specs for a phase."""
+        num = min(getattr(config, "max_personas", 100), 1000)
+        seeds = [
+            {"name": f"precision_{i}", "style": "concise", "risk": 0.1}
+            for i in range(num // 4)
+        ] + [
+            {"name": f"creative_{i}", "style": "divergent", "risk": 0.6}
+            for i in range(num // 4)
+        ] + [
+            {"name": f"optimizer_{i}", "style": "performance", "risk": 0.3}
+            for i in range(num // 4)
+        ] + [
+            {"name": f"analyst_{i}", "style": "analytical", "risk": 0.2}
+            for i in range(num - 3 * (num // 4))
+        ]
+        for s in seeds:
+            s["phase_bias"] = phase
+        return seeds
+
+    def _score_persona(self, persona: Dict[str, Any], context: Dict[str, Any]) -> float:
+        """Score a persona using simple heuristics and prior outcomes (if any)."""
+        base = 0.5
+        style = persona.get("style")
+        if context.get("need_precise"):
+            base += 0.3 if style == "concise" else 0
+        if context.get("need_creative"):
+            base += 0.3 if style == "divergent" else 0
+        if context.get("performance_critical"):
+            base += 0.2 if style == "performance" else 0
+        if context.get("analysis_required"):
+            base += 0.2 if style == "analytical" else 0
+        risk = persona.get("risk", 0.2)
+        base -= 0.1 * max(0, risk - 0.3)
+        return max(0.0, min(1.0, base))
+
+    def _select_persona(self, phase: str, context: Dict[str, Any]) -> Dict[str, Any]:
+        personas = self._synthesize_personas(phase)
+        scored = sorted(personas, key=lambda p: self._score_persona(p, context), reverse=True)
+        return scored[0] if scored else {"name": "default", "style": "concise", "risk": 0.2}
+
+    def _persona_prefix(self, persona: Dict[str, Any]) -> str:
+        return (
+            f"[PERSONA:{persona.get('name')} STYLE:{persona.get('style')} RISK:{persona.get('risk')}]\n"
+        )
+
     def _get_supported_modalities(self) -> List[Modality]:
         """Get supported modalities for the current model"""
         if self.current_model and self.current_model in self.available_models:
@@ -1841,12 +1890,20 @@ class QuantumCognitiveAI:
             f"API call attempt with model: {model_name_to_use} for phase: {phase}"
         )
 
+        # Persona auto-selection
+        persona = self._select_persona(phase, {
+            "need_precise": is_json,
+            "need_creative": phase in {"Code Crafter", "Cognitive Architect"},
+            "performance_critical": phase in {"Security Scanner", "Performance Optimizer"},
+            "analysis_required": phase in {"Constraints Analyst", "Judge", "Reviewer"},
+        })
+
         if cognitive_state:
             filtered_prompt = self._apply_cognitive_filter(
-                prompt, cognitive_state, dev_strategy
+                self._persona_prefix(persona) + prompt, cognitive_state, dev_strategy
             )
         else:
-            filtered_prompt = prompt
+            filtered_prompt = self._persona_prefix(persona) + prompt
 
         # Prompt cache lookup (after filtered_prompt is set)
         cache_key = None
