@@ -2516,6 +2516,8 @@ Please repair and return ONLY valid JSON that conforms to the schema. No explana
         cognitive_state: Dict = None,
         dev_strategy: str = None,
         tests_override: Optional[str] = None,
+        acceptance_criteria: Optional[List[str]] = None,
+        module_name: Optional[str] = None,
     ) -> Dict:
         """Enhanced validation with actual test execution for TDD."""
         validation = {"is_valid": True, "feedback": ""}
@@ -2530,9 +2532,14 @@ Please repair and return ONLY valid JSON that conforms to the schema. No explana
             except SyntaxError as e:
                 return {"is_valid": False, "feedback": f"Syntax error: {e}"}
 
-        if dev_strategy == DevelopmentStrategy.TDD.value:
+        if dev_strategy == DevelopmentStrategy.TDD.value or tests_override is not None or acceptance_criteria:
             # Generate and run tests (or use provided tests for strict TDD)
-            test_code = tests_override or await self._generate_tests(code, language)
+            test_code = tests_override or await self._generate_tests(
+                code,
+                language,
+                acceptance_criteria=acceptance_criteria,
+                module_name=module_name,
+            )
             coverage_report = self._run_tests_and_coverage(test_code, code, language)
             if (
                 coverage_report["coverage"]
@@ -2555,9 +2562,30 @@ Please repair and return ONLY valid JSON that conforms to the schema. No explana
 
         return validation
 
-    async def _generate_tests(self, code: str, language: str) -> str:
-        """Generate tests using AI."""
-        prompt = f"Generate comprehensive tests for this {language} code:\n{code}"
+    async def _generate_tests(
+        self,
+        code: str,
+        language: str,
+        acceptance_criteria: Optional[List[str]] = None,
+        module_name: Optional[str] = None,
+    ) -> str:
+        """Generate tests using AI informed by acceptance criteria and module context."""
+        criteria_text = (
+            "\n\nAcceptance criteria:\n- "
+            + "\n- ".join(acceptance_criteria)
+            if acceptance_criteria
+            else ""
+        )
+        module_hint = f"\n\nModule under test: {module_name}" if module_name else ""
+        prompt = (
+            f"Generate comprehensive, deterministic tests for this {language} code.{module_hint}{criteria_text}\n"
+            f"Tests must:\n"
+            f"- Be runnable with pytest\n"
+            f"- Avoid external network calls (mock as needed)\n"
+            f"- Assert the acceptance criteria explicitly if provided\n"
+            f"- Use clear, minimal fixtures\n\n"
+            f"CODE UNDER TEST:\n{code}"
+        )
         return await self._make_api_call(prompt, "Test Generator")
 
     def _run_tests_and_coverage(
@@ -3792,7 +3820,8 @@ class UltraCognitiveForgeOrchestrator:
                     target_file = candidate_files[0] if candidate_files else "src/agent.py"
 
                 return {
-                    "task_type": TaskType.CODE_MODIFICATION.value,
+                    # Prefer TDD for new story implementation to ensure tests
+                    "task_type": TaskType.TDD_IMPLEMENTATION.value,
                     "task_description": f"Implement user story: {story.get('description', 'Story')} in {target_file}",
                     "details": {
                         "target_file": target_file,
@@ -4200,10 +4229,16 @@ class UltraCognitiveForgeOrchestrator:
             try:
                 logger.info(f"Generating tests first for TDD: {target_file}")
                 # Use current (possibly empty) blueprint context to author tests
-                tests_override = await self.ai._generate_tests("", language)
+                story_criteria = task.get("details", {}).get("acceptance_criteria", [])
+                module_name = Path(target_file).stem
+                tests_override = await self.ai._generate_tests(
+                    "",
+                    language,
+                    acceptance_criteria=story_criteria,
+                    module_name=module_name,
+                )
                 # Persist tests into the repo so they are visible and durable
                 if language == "python":
-                    module_name = Path(target_file).stem
                     test_path = f"tests/test_{module_name}.py"
                     self.assembler.add_file(test_path, tests_override)
                     self.assembler.write_files_to_disk()
@@ -4229,6 +4264,8 @@ class UltraCognitiveForgeOrchestrator:
                     self.project_state.cognitive_state,
                     dev_strategy,
                     tests_override=tests_override,
+                    acceptance_criteria=task.get("details", {}).get("acceptance_criteria", []),
+                    module_name=Path(target_file).stem,
                 )
 
                 if validation_result.get("is_valid"):
@@ -4257,6 +4294,16 @@ class UltraCognitiveForgeOrchestrator:
                 )
                 feedback = f"An unexpected error occurred: {e}. Please try an alternative approach."
 
+        # If TDD task failed repeatedly, enqueue a fallback CODE_MODIFICATION task to unblock progress
+        if dev_strategy == DevelopmentStrategy.TDD.value:
+            self.project_state.task_queue.insert(
+                0,
+                {
+                    "task_type": TaskType.CODE_MODIFICATION.value,
+                    "task_description": f"Fallback implementation for {target_file}",
+                    "details": {"target_file": target_file},
+                },
+            )
         return (
             False,
             f"Failed to generate valid code for {target_file} after {config.max_debug_attempts} attempts.",
