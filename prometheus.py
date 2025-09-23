@@ -488,6 +488,7 @@ class Config:
                 "test_coverage_threshold": 0.95,  # High coverage requirement
                 "mock_external_calls": True,
                 "refactor_after_test": True,
+                "mutation_threshold": 0.6,
             },
             "agile": {
                 "sprint_duration": 14,  # Days
@@ -510,6 +511,14 @@ class Config:
         # Performance toggles
         # Skip per-file detailed blueprints and go straight to code generation
         self.skip_detailed_blueprints = True
+        # Diff guard toggles
+        self.enable_diff_guard = True
+        self.forbidden_diff_patterns = [
+            r"AKIA[0-9A-Z]{16}",  # AWS Access Key ID
+            r"-----BEGIN (?:RSA|DSA|EC) PRIVATE KEY-----",
+            r"rm\s+-rf\s+/",  # dangerous destructive command
+            r"curl\s+http[s]?://[^\s]+\s*\|\s*sh",  # curl pipe to shell
+        ]
 
         # Language configs with enhanced TDD support
         self.language_configs["python"]["test_command"] = (
@@ -2565,6 +2574,31 @@ Please repair and return ONLY valid JSON that conforms to the schema. No explana
         if lint_result["issues"]:
             validation["feedback"] += f" Linting issues: {lint_result['issues']}"
 
+        # Mutation testing (lightweight) for TDD: flip simple comparisons and rerun tests
+        if dev_strategy == DevelopmentStrategy.TDD.value:
+            try:
+                mutated = code
+                mutated = re.sub(r"==", "!=", mutated)
+                mutated = re.sub(r">=", "<", mutated)
+                mutated = re.sub(r"<=", ">", mutated)
+                test_code = tests_override or await self._generate_tests(
+                    code,
+                    language,
+                    acceptance_criteria=acceptance_criteria,
+                    module_name=module_name,
+                )
+                report = self._run_tests_and_coverage(test_code, mutated, language)
+                kill_ratio = 1.0 if report["failing_tests"] else 0.0
+                if kill_ratio < config.strategy_configs[DevelopmentStrategy.TDD.value][
+                    "mutation_threshold"
+                ]:
+                    return {
+                        "is_valid": False,
+                        "feedback": f"Mutation tests too weak (kill_ratio={kill_ratio:.2f}). Strengthen tests.",
+                    }
+            except Exception as e:
+                logger.warning(f"Mutation testing skipped due to error: {e}")
+
         return validation
 
     async def _generate_tests(
@@ -3241,6 +3275,13 @@ class ToolRegistry:
     def __init__(self, tools=None):
         self.tools = tools or []
         self.cognitive_patterns = {}
+        # Simple in-memory broker metrics
+        self.metrics = collections.defaultdict(lambda: {
+            "success": 0,
+            "fail": 0,
+            "avg_ms": 0.0,
+            "calls": 0,
+        })
 
     def register(self, tool):
         self.tools.append(tool)
@@ -3275,6 +3316,29 @@ class ToolRegistry:
             if getattr(tool, "name", None) == name:
                 return tool
         return None
+
+    def record_result(self, tool_name: str, ok: bool, elapsed_ms: float):
+        m = self.metrics[tool_name]
+        m["calls"] += 1
+        if ok:
+            m["success"] += 1
+        else:
+            m["fail"] += 1
+        # incremental average
+        m["avg_ms"] = ((m["avg_ms"] * (m["calls"] - 1)) + elapsed_ms) / m["calls"]
+
+    def rank_tools(self, prefer: Optional[List[str]] = None) -> List[str]:
+        names = [getattr(t, "name", None) for t in self.tools]
+        def score(n):
+            m = self.metrics.get(n, {})
+            success = m.get("success", 0)
+            calls = m.get("calls", 1)
+            avg_ms = max(1.0, m.get("avg_ms", 1.0))
+            s = (success / calls) / avg_ms
+            if prefer and n in prefer:
+                s *= 1.25
+            return s
+        return sorted(names, key=score, reverse=True)
 
     def list_tools(self):
         return [getattr(tool, "name", None) for tool in self.tools]
@@ -4299,6 +4363,10 @@ class UltraCognitiveForgeOrchestrator:
         for attempt in range(config.max_debug_attempts):
             logger.info(f"Code generation attempt {attempt + 1} for {target_file}...")
             try:
+                # PRIME with memory exemplars (short snippets) to improve reliability
+                exemplars = self.memory.retrieve_similar_memories(
+                    f"{self.project_state.goal} {target_file}", n_results=2
+                )
                 generated_code = await self.ai.code_crafter(
                     goal=self.project_state.goal,
                     task=task,
@@ -4320,6 +4388,12 @@ class UltraCognitiveForgeOrchestrator:
                 )
 
                 if validation_result.get("is_valid"):
+                    # Diff guard: block forbidden patterns
+                    if config.enable_diff_guard:
+                        for patt in config.forbidden_diff_patterns:
+                            if re.search(patt, generated_code):
+                                logger.error(f"Diff guard blocked change for {target_file}: pattern {patt}")
+                                return False, f"Diff guard blocked change for security pattern: {patt}"
                     logger.info(f"Code for {target_file} passed validation.")
                     self.assembler.add_file(target_file, generated_code)
                     self.assembler.write_files_to_disk()
