@@ -3600,6 +3600,186 @@ class EvidenceStore:
     def get_all(self) -> List[Evidence]:
         return list(self.cache.values())
 
+
+# --- Topic Clusterer ---
+class TopicClusterer:
+    def __init__(self, max_vocab: int = 500, eps: float = 0.35, min_samples: int = 1):
+        self.max_vocab = max_vocab
+        self.eps = eps
+        self.min_samples = min_samples
+        self.stopwords = set(
+            [
+                "the",
+                "a",
+                "an",
+                "and",
+                "or",
+                "of",
+                "to",
+                "in",
+                "for",
+                "on",
+                "with",
+                "by",
+                "is",
+                "are",
+                "be",
+                "that",
+                "as",
+                "from",
+                "this",
+                "it",
+                "at",
+                "into",
+                "over",
+                "about",
+            ]
+        )
+
+    def _tokenize(self, text: str) -> List[str]:
+        return [
+            t
+            for t in re.split(r"[^a-z0-9]+", text.lower())
+            if t and t not in self.stopwords and not t.isdigit()
+        ]
+
+    def _vectorize(self, evidences: List[Evidence]) -> Tuple[np.ndarray, List[str]]:
+        token_counts = {}
+        docs_tokens = []
+        for ev in evidences:
+            toks = self._tokenize(ev.title + " " + ev.snippet)
+            docs_tokens.append(toks)
+            for t in set(toks):
+                token_counts[t] = token_counts.get(t, 0) + 1
+        # Select top-k vocabulary
+        vocab = [t for t, _ in sorted(token_counts.items(), key=lambda x: -x[1])[: self.max_vocab]]
+        vocab_index = {t: i for i, t in enumerate(vocab)}
+        mat = np.zeros((len(evidences), len(vocab)), dtype=np.float32)
+        for i, toks in enumerate(docs_tokens):
+            for t in toks:
+                j = vocab_index.get(t)
+                if j is not None:
+                    mat[i, j] += 1.0
+            # Normalize row
+            norm = np.linalg.norm(mat[i])
+            if norm > 0:
+                mat[i] /= norm
+        return mat, vocab
+
+    def cluster(self, evidences: List[Evidence]) -> Dict[int, List[Evidence]]:
+        if not evidences:
+            return {}
+        X, _ = self._vectorize(evidences)
+        try:
+            model = DBSCAN(eps=self.eps, min_samples=self.min_samples, metric="cosine")
+            labels = model.fit_predict(X)
+        except Exception:
+            labels = np.zeros((len(evidences),), dtype=int)
+        clusters: Dict[int, List[Evidence]] = {}
+        for ev, lab in zip(evidences, labels):
+            clusters.setdefault(int(lab), []).append(ev)
+        return clusters
+
+    def cluster_topics(self, cluster_evidences: List[Evidence], top_k: int = 3) -> str:
+        # Extract top tokens as topic label
+        text = " ".join([ev.title + " " + ev.snippet for ev in cluster_evidences])
+        toks = self._tokenize(text)
+        freq = {}
+        for t in toks:
+            freq[t] = freq.get(t, 0) + 1
+        top = [t for t, _ in sorted(freq.items(), key=lambda x: -x[1])[:top_k]]
+        return " / ".join(top) if top else "general"
+
+
+# --- Constraint Validator & Risk Forecaster ---
+class ConstraintValidator:
+    def validate(self, constraints: List[str], research_summary: str) -> Dict[str, Any]:
+        issues = []
+        for c in constraints or []:
+            # Simple keyword check: all non-trivial words should appear
+            words = [w for w in re.split(r"[^a-z0-9]+", c.lower()) if len(w) > 3]
+            if not words:
+                continue
+            missing = [w for w in words if w not in research_summary.lower()]
+            if len(missing) >= max(1, len(words) // 2):
+                issues.append({"constraint": c, "missing_terms": missing})
+        return {"issues": issues, "passed": len(issues) == 0}
+
+
+class RiskForecaster:
+    def forecast(
+        self, constraints: List[str], evidence: List[Evidence]
+    ) -> List[Dict[str, Any]]:
+        risks = []
+        # Evidence sparsity risk
+        if len(evidence) < 5:
+            risks.append(
+                {
+                    "description": "Sparse evidence base; plan may overlook critical factors.",
+                    "likelihood": 0.6,
+                    "impact": 0.7,
+                    "mitigation": "Increase research queries and diversify sources.",
+                }
+            )
+        # Specific domain risks
+        text = " ".join([ev.title + " " + ev.snippet for ev in evidence]).lower()
+        if "email" in " ".join(constraints).lower() and "smtp" not in text:
+            risks.append(
+                {
+                    "description": "Email delivery reliability uncertain (SMTP specifics lacking).",
+                    "likelihood": 0.5,
+                    "impact": 0.6,
+                    "mitigation": "Prototype email sending with STARTTLS and retries; capture bounce logs.",
+                }
+            )
+        if "bot" in " ".join(constraints).lower() and "captcha" not in text:
+            risks.append(
+                {
+                    "description": "Bot detection avoidance not evidenced (CAPTCHA/headers).",
+                    "likelihood": 0.5,
+                    "impact": 0.5,
+                    "mitigation": "Randomize headers, backoff schedules; detect and bypass simple blocks legally.",
+                }
+            )
+        return risks
+
+
+# --- Roadmapper & Export ---
+class Roadmapper:
+    def build(self, plan: PlanGraph, clusters: Dict[int, List[Evidence]]) -> List[Dict[str, Any]]:
+        milestones = []
+        for lab, evs in clusters.items():
+            title = f"Milestone: {lab}"
+            est = max(6.0, 4.0 + 2.0 * np.log1p(len(evs)))
+            milestones.append(
+                {
+                    "title": title,
+                    "estimate_hours": float(est),
+                    "deliverables": ["Research brief", "Design doc", "Prototype", "Tests"],
+                }
+            )
+        return milestones
+
+
+class PlanExporter:
+    def __init__(self, base_dir: str):
+        self.base_dir = base_dir
+
+    def export(self, plan: PlanGraph, evidence: List[Evidence], summary: str, milestones: List[Dict[str, Any]]):
+        out_dir = create_dir_safely(str(Path(self.base_dir) / "docs"))
+        # JSON
+        with open(Path(out_dir) / "deep_plan.json", "w", encoding="utf-8") as f:
+            f.write(plan.to_json())
+        # Markdown
+        md = ["# Deep Plan\n", "\n## Summary\n", summary, "\n## Milestones\n"]
+        for m in milestones:
+            md.append(f"- {m['title']} (~{m['estimate_hours']:.1f}h): {', '.join(m['deliverables'])}")
+        md.append("\n## Evidence\n")
+        for i, ev in enumerate(sorted(evidence, key=lambda x: -x.score), 1):
+            md.append(f"[{i}] {ev.title} - {ev.url}")
+        with open(Path(out_dir) / "deep_plan.md", "w", encoding="utf-8") as f:
+            f.write("\n".join(md))
+
     def get_tools_by_strategy(self, strategy: str) -> List[str]:
         """Get tools relevant to strategy."""
         if strategy == DevelopmentStrategy.TDD.value:
@@ -3910,7 +4090,8 @@ class UltraCognitiveForgeOrchestrator:
                     f"{self.goal} implementation guide",
                 ]
                 await self.ai.web_research(queries, self.evidence_store, config.research_budgets)
-                summary = await self.ai.research_summary(self.goal, self.evidence_store.get_all(), self.project_state.development_strategy)
+                evidence_list = self.evidence_store.get_all()
+                summary = await self.ai.research_summary(self.goal, evidence_list, self.project_state.development_strategy)
                 # Seed plan graph root
                 self.plan_graph = PlanGraph(goal=self.goal)
                 self.plan_graph.nodes[self.plan_graph.root_id] = PlanNode(
@@ -3920,6 +4101,46 @@ class UltraCognitiveForgeOrchestrator:
                     decisions=["Seeded by deep planner"],
                 )
                 logger.info("Deep Planner: Research summary synthesized.")
+
+                # Topic clustering
+                clusterer = TopicClusterer()
+                clusters = clusterer.cluster(evidence_list)
+                # Create child nodes per cluster
+                for lab, evs in clusters.items():
+                    node_id = f"cluster_{lab}"
+                    topic = clusterer.cluster_topics(evs)
+                    self.plan_graph.nodes[node_id] = PlanNode(
+                        id=node_id,
+                        title=f"Cluster: {topic}",
+                        objective=f"Investigate {topic}",
+                    )
+                    self.plan_graph.nodes[self.plan_graph.root_id].children.append(node_id)
+
+                # Validate constraints against summary (if any)
+                try:
+                    constraints = []
+                    validator = ConstraintValidator()
+                    val = validator.validate(constraints, summary)
+                    if not val.get("passed", True):
+                        logger.warning(f"Constraint validation issues: {val['issues']}")
+                except Exception:
+                    pass
+
+                # Risk forecasting
+                try:
+                    forecaster = RiskForecaster()
+                    risks = forecaster.forecast([], evidence_list)
+                    self.plan_graph.nodes[self.plan_graph.root_id].risks = [r["description"] for r in risks]
+                    self.plan_graph.nodes[self.plan_graph.root_id].mitigations = [r["mitigation"] for r in risks]
+                except Exception:
+                    pass
+
+                # Roadmap and export
+                roadmapper = Roadmapper()
+                milestones = roadmapper.build(self.plan_graph, clusters)
+                exporter = PlanExporter(self.sandbox_dir)
+                exporter.export(self.plan_graph, evidence_list, summary, milestones)
+                logger.info("Deep Planner: Exported plan and roadmap.")
             # Phase 1: Master Planner
             plan = await self.ai.master_planner(
                 self.goal,
