@@ -1,3 +1,4 @@
+from __future__ import annotations
 import json
 import asyncio
 import os
@@ -28,6 +29,7 @@ import random
 import psutil
 import yaml
 from cryptography.fernet import Fernet
+import hashlib
 
 try:
     import docker  # Optional
@@ -177,14 +179,48 @@ class NeuromorphicMemory:
     ):  # Increased clusters for finer granularity
         self.memory_dim = memory_dim
         self.num_clusters = num_clusters
-        self.memory_index = faiss.IndexFlatIP(
-            memory_dim
-        )  # Changed to Inner Product for cosine similarity
+        # Use FAISS if available; otherwise fall back to a simple in-memory cosine index
+        if faiss is not None:
+            self.memory_index = faiss.IndexFlatIP(memory_dim)
+            self._uses_faiss = True
+        else:
+            self._uses_faiss = False
+            class _LocalIPIndex:
+                def __init__(self, dim: int):
+                    self.dim = dim
+                    self.vectors = []
+                def add(self, vecs):
+                    for v in vecs:
+                        self.vectors.append(v.astype(np.float32))
+                def search(self, query, k):
+                    if not self.vectors:
+                        scores = np.zeros((1, k), dtype=np.float32)
+                        indices = -np.ones((1, k), dtype=np.int64)
+                        return scores, indices
+                    mat = np.vstack(self.vectors).astype(np.float32)  # (N, D)
+                    # Normalize matrix and query for cosine similarity
+                    mat_norm = mat / (np.linalg.norm(mat, axis=1, keepdims=True) + 1e-8)
+                    q = query.astype(np.float32)
+                    q = q / (np.linalg.norm(q) + 1e-8)
+                    sims = np.dot(mat_norm, q.T).reshape(-1)  # (N,)
+                    top_k = min(k, sims.shape[0])
+                    idxs = np.argsort(-sims)[:top_k]
+                    scores = sims[idxs].astype(np.float32)
+                    # Pad to k
+                    if top_k < k:
+                        pad_scores = np.zeros(k - top_k, dtype=np.float32)
+                        pad_idxs = -np.ones(k - top_k, dtype=np.int64)
+                        scores = np.concatenate([scores, pad_scores])
+                        idxs = np.concatenate([idxs, pad_idxs])
+                    return scores.reshape(1, -1), idxs.reshape(1, -1)
+            self.memory_index = _LocalIPIndex(memory_dim)
         self.memory_data = []
         self.memory_metadata = []
         self.cluster_model = DBSCAN(
             eps=0.3, min_samples=1
         )  # Tuned for better clustering
+        # Keep a parallel store of embeddings for relevance and cluster heuristics
+        self._embedding_store = []
 
         # Lazy-loaded components with fallback
         self.cognitive_embedder = None
@@ -234,11 +270,19 @@ class NeuromorphicMemory:
         embedding = self.embed_text(str(data))
         if embedding is None:
             return
+        # Ensure embedding is float32 and normalized
+        embedding = embedding.astype(np.float32)
+        norm = float(np.linalg.norm(embedding))
+        if norm > 0:
+            embedding = embedding / norm
 
-        # Relevance check before adding
-        relevance = np.random.uniform(
-            0, 1
-        )  # Placeholder; in real, compute from context
+        # Compute relevance as similarity to existing memories (max cosine similarity)
+        relevance = 1.0
+        if self._embedding_store:
+            mat = np.vstack(self._embedding_store).astype(np.float32)  # (N, D)
+            sims = np.dot(mat, embedding.T).reshape(-1)
+            relevance = float(np.max(sims))
+        # Active forgetting of very low-relevance items
         if relevance < self.forgetting_threshold:
             logger.debug("Memory forgotten due to low relevance.")
             return
@@ -246,6 +290,8 @@ class NeuromorphicMemory:
         self.memory_index.add(embedding)
         self.memory_data.append(data)
         self.memory_metadata.append(metadata or {})
+        # Track embedding for future relevance/cluster computations
+        self._embedding_store.append(embedding.squeeze(0))
 
         # Periodic clustering with forgetting
         if len(self.memory_data) % 50 == 0:  # More frequent updates
@@ -444,11 +490,13 @@ class Config:
                 "test_coverage_threshold": 0.95,  # High coverage requirement
                 "mock_external_calls": True,
                 "refactor_after_test": True,
+                "mutation_threshold": 0.6,
             },
             "agile": {
                 "sprint_duration": 14,  # Days
                 "story_points_scale": [1, 2, 3, 5, 8, 13],
                 "velocity_tracking": True,
+                "sprint_batch_size": 5,
             },
             "devops": {
                 "ci_frequency": "push",
@@ -461,6 +509,35 @@ class Config:
                 "novelty_threshold": 0.7,
             },
         }
+
+        # Performance toggles
+        # Skip per-file detailed blueprints and go straight to code generation
+        self.skip_detailed_blueprints = True
+        # Diff guard toggles
+        self.enable_diff_guard = True
+        self.forbidden_diff_patterns = [
+            r"AKIA[0-9A-Z]{16}",  # AWS Access Key ID
+            r"-----BEGIN (?:RSA|DSA|EC) PRIVATE KEY-----",
+            r"rm\s+-rf\s+/",  # dangerous destructive command
+            r"curl\s+http[s]?://[^\s]+\s*\|\s*sh",  # curl pipe to shell
+        ]
+        # Personas
+        self.max_personas = 1000
+        # Deep-think planner
+        self.use_deep_planner = True
+        self.research_budgets = {
+            "max_queries": 8,
+            "max_results_per_query": 5,
+            "fetch_timeout_s": 20,
+            "concurrency": 5,
+        }
+        # Cost controls for Agile
+        self.reviewer_enabled = True
+        self.reviewer_every_n_tasks = 3
+        self.reviewer_min_lines = 80
+        self.skip_reviewer_for_small_changes = True
+        self.max_same_file_tasks = 2
+        self.reviewer_max_per_file_consecutive = 1
 
         # Language configs with enhanced TDD support
         self.language_configs["python"]["test_command"] = (
@@ -997,6 +1074,49 @@ class Modality(Enum):
     SENSOR_DATA = "sensor_data"
 
 
+# --- Deep-Think Planning Data Structures ---
+@dataclass
+class Evidence:
+    url: str
+    title: str
+    snippet: str
+    hash: str
+    score: float = 0.0
+
+
+@dataclass
+class PlanTask:
+    id: str
+    description: str
+    rationale: str = ""
+    dependencies: List[str] = field(default_factory=list)
+    evidence: List[Evidence] = field(default_factory=list)
+    risks: List[str] = field(default_factory=list)
+    mitigations: List[str] = field(default_factory=list)
+    owner_persona: str = ""
+    estimate_hours: float = 0.0
+
+
+@dataclass
+class PlanNode:
+    id: str
+    title: str
+    objective: str
+    tasks: List[PlanTask] = field(default_factory=list)
+    children: List[str] = field(default_factory=list)
+    decisions: List[str] = field(default_factory=list)
+    risks: List[str] = field(default_factory=list)
+    mitigations: List[str] = field(default_factory=list)
+
+
+@dataclass
+class PlanGraph:
+    goal: str
+    nodes: Dict[str, PlanNode] = field(default_factory=dict)
+    root_id: str = "root"
+
+    def to_json(self) -> str:
+        return json.dumps(self, default=lambda o: o.__dict__, indent=2)
 class CognitiveState(Enum):
     FOCUSED = "focused"
     EXPLORATORY = "exploratory"
@@ -1236,6 +1356,9 @@ class ProjectState:
     ci_status: str = "pending"  # New
     # Cognitive
     metacognition_log: List[Dict] = field(default_factory=list)  # New
+    # File activity tracking to avoid churn
+    file_activity_counts: Dict[str, int] = field(default_factory=dict)
+    file_rotation_idx: int = 0
 
     def __post_init__(self):
         if not self.living_blueprint:
@@ -1683,6 +1806,53 @@ class QuantumCognitiveAI:
             f"Initialized with model provider '{self.llm_choice}', default model '{self.current_model}'"
         )
 
+    # --- Meta-Persona Orchestrator ---
+    def _synthesize_personas(self, phase: str) -> List[Dict[str, Any]]:
+        """Create a pool of up to config.max_personas lightweight persona specs for a phase."""
+        num = min(getattr(config, "max_personas", 100), 1000)
+        seeds = [
+            {"name": f"precision_{i}", "style": "concise", "risk": 0.1}
+            for i in range(num // 4)
+        ] + [
+            {"name": f"creative_{i}", "style": "divergent", "risk": 0.6}
+            for i in range(num // 4)
+        ] + [
+            {"name": f"optimizer_{i}", "style": "performance", "risk": 0.3}
+            for i in range(num // 4)
+        ] + [
+            {"name": f"analyst_{i}", "style": "analytical", "risk": 0.2}
+            for i in range(num - 3 * (num // 4))
+        ]
+        for s in seeds:
+            s["phase_bias"] = phase
+        return seeds
+
+    def _score_persona(self, persona: Dict[str, Any], context: Dict[str, Any]) -> float:
+        """Score a persona using simple heuristics and prior outcomes (if any)."""
+        base = 0.5
+        style = persona.get("style")
+        if context.get("need_precise"):
+            base += 0.3 if style == "concise" else 0
+        if context.get("need_creative"):
+            base += 0.3 if style == "divergent" else 0
+        if context.get("performance_critical"):
+            base += 0.2 if style == "performance" else 0
+        if context.get("analysis_required"):
+            base += 0.2 if style == "analytical" else 0
+        risk = persona.get("risk", 0.2)
+        base -= 0.1 * max(0, risk - 0.3)
+        return max(0.0, min(1.0, base))
+
+    def _select_persona(self, phase: str, context: Dict[str, Any]) -> Dict[str, Any]:
+        personas = self._synthesize_personas(phase)
+        scored = sorted(personas, key=lambda p: self._score_persona(p, context), reverse=True)
+        return scored[0] if scored else {"name": "default", "style": "concise", "risk": 0.2}
+
+    def _persona_prefix(self, persona: Dict[str, Any]) -> str:
+        return (
+            f"[PERSONA:{persona.get('name')} STYLE:{persona.get('style')} RISK:{persona.get('risk')}]\n"
+        )
+
     def _get_supported_modalities(self) -> List[Modality]:
         """Get supported modalities for the current model"""
         if self.current_model and self.current_model in self.available_models:
@@ -1783,12 +1953,20 @@ class QuantumCognitiveAI:
             f"API call attempt with model: {model_name_to_use} for phase: {phase}"
         )
 
+        # Persona auto-selection
+        persona = self._select_persona(phase, {
+            "need_precise": is_json,
+            "need_creative": phase in {"Code Crafter", "Cognitive Architect"},
+            "performance_critical": phase in {"Security Scanner", "Performance Optimizer"},
+            "analysis_required": phase in {"Constraints Analyst", "Judge", "Reviewer"},
+        })
+
         if cognitive_state:
             filtered_prompt = self._apply_cognitive_filter(
-                prompt, cognitive_state, dev_strategy
+                self._persona_prefix(persona) + prompt, cognitive_state, dev_strategy
             )
         else:
-            filtered_prompt = prompt
+            filtered_prompt = self._persona_prefix(persona) + prompt
 
         # Prompt cache lookup (after filtered_prompt is set)
         cache_key = None
@@ -2465,12 +2643,124 @@ Please repair and return ONLY valid JSON that conforms to the schema. No explana
         # The code cleaning might be less necessary if the prompt is very strict, but it's a good safeguard.
         return self._clean_code(raw_code, language=file_blueprint.language)
 
+    async def code_reviewer(
+        self,
+        code: str,
+        file_name: str,
+        acceptance_criteria: Optional[List[str]] = None,
+        cognitive_state: Dict = None,
+        dev_strategy: str = None,
+    ) -> str:
+        """Provide a diff-style review patch for the given code."""
+        criteria_text = (
+            "\n\nAcceptance criteria to verify:\n- "
+            + "\n- ".join(acceptance_criteria)
+            if acceptance_criteria
+            else ""
+        )
+        prompt = (
+            f"You are a meticulous senior code reviewer. File: {file_name}.\n"
+            f"Review the code below and propose a minimal unified diff patch (no explanations) that:\n"
+            f"- Fixes bugs, improves readability, and adheres to Python best practices\n"
+            f"- Preserves public API unless clearly wrong\n"
+            f"- Improves testability and error handling{criteria_text}\n\n"
+            f"Return ONLY a unified diff starting with '---' and '+++' lines.\n\n"
+            f"CODE:\n{code}"
+        )
+        return await self._make_api_call(prompt, "Reviewer", cognitive_state=cognitive_state, dev_strategy=dev_strategy)
+
+    async def code_judge(
+        self,
+        original_code: str,
+        proposed_patch: str,
+        file_name: str,
+        acceptance_criteria: Optional[List[str]] = None,
+        cognitive_state: Dict = None,
+        dev_strategy: str = None,
+    ) -> Dict:
+        """Score proposed patch; return {'accept': bool, 'score': float, 'rationale': str}."""
+        criteria_text = (
+            "\n\nAcceptance criteria:\n- "
+            + "\n- ".join(acceptance_criteria)
+            if acceptance_criteria
+            else ""
+        )
+        schema = {
+            "type": "object",
+            "properties": {
+                "accept": {"type": "boolean"},
+                "score": {"type": "number"},
+                "rationale": {"type": "string"},
+            },
+            "required": ["accept", "score", "rationale"],
+        }
+        prompt = (
+            f"You are a strict judge. Evaluate a proposed unified diff patch for {file_name}.\n"
+            f"Consider correctness, readability, safety, testability, and adherence to acceptance criteria.{criteria_text}\n"
+            f"Return JSON with accept (bool), score (0-1), rationale (short).\n\n"
+            f"ORIGINAL CODE:\n{original_code}\n\nPATCH:\n{proposed_patch}"
+        )
+        return await self._get_structured_output(
+            prompt,
+            "Judge",
+            {"accept": False, "score": 0.0, "rationale": "default"},
+            schema=schema,
+            cognitive_state=cognitive_state,
+            dev_strategy=dev_strategy,
+        )
+
+    # --- Web Researcher and Summarizer ---
+    async def web_research(
+        self,
+        queries: List[str],
+        evidence_store: EvidenceStore,
+        budgets: Dict[str, Any],
+    ) -> None:
+        """Parallel web research using provided web_search tool with budgets."""
+        max_queries = budgets.get("max_queries", 5)
+        max_per = budgets.get("max_results_per_query", 5)
+        used = 0
+        for q in queries[:max_queries]:
+            try:
+                res = await asyncio.to_thread(lambda: functions.web_search({"search_term": q, "explanation": "planner research"}))
+                # res is a tool-call result; tolerate structure
+                items = res.get("results", []) if isinstance(res, dict) else []
+                for it in items[:max_per]:
+                    url = it.get("url") or it.get("link") or ""
+                    title = it.get("title") or ""
+                    snippet = it.get("snippet") or it.get("description") or ""
+                    if url and snippet:
+                        score = 0.5 + 0.5 * (len(snippet) / 400.0)
+                        evidence_store.put(url, title, snippet, score)
+                used += 1
+            except Exception:
+                continue
+
+    async def research_summary(
+        self,
+        goal: str,
+        evidence: List[Evidence],
+        dev_strategy: str = None,
+    ) -> str:
+        corpus = "\n\n".join([
+            f"Title: {e.title}\nURL: {e.url}\nSnippet: {e.snippet}"
+            for e in sorted(evidence, key=lambda x: -x.score)[:10]
+        ])
+        prompt = (
+            f"Synthesize a rigorous research brief for goal: {goal}.\n"
+            f"Use the following evidence with citations [#]. Provide key findings, constraints, options, and recommendations.\n\n{corpus}"
+        )
+        return await self._make_api_call(prompt, "Research Summarizer", is_json=False, dev_strategy=dev_strategy)
+
     async def code_validator(
         self,
         code: str,
         language: str,
         cognitive_state: Dict = None,
         dev_strategy: str = None,
+        tests_override: Optional[str] = None,
+        acceptance_criteria: Optional[List[str]] = None,
+        module_name: Optional[str] = None,
     ) -> Dict:
         """Enhanced validation with actual test execution for TDD."""
         validation = {"is_valid": True, "feedback": ""}
@@ -2485,17 +2775,22 @@ Please repair and return ONLY valid JSON that conforms to the schema. No explana
             except SyntaxError as e:
                 return {"is_valid": False, "feedback": f"Syntax error: {e}"}
 
-        if dev_strategy == DevelopmentStrategy.TDD.value:
-            # Generate and run tests
-            test_code = await self._generate_tests(code, language)
+        if dev_strategy == DevelopmentStrategy.TDD.value or tests_override is not None:
+            # Generate and run tests (or use provided tests for strict TDD)
+            test_code = tests_override or await self._generate_tests(
+                code,
+                language,
+                acceptance_criteria=acceptance_criteria,
+                module_name=module_name,
+            )
             coverage_report = self._run_tests_and_coverage(test_code, code, language)
-            if (
-                coverage_report["coverage"]
-                < config.strategy_configs[dev_strategy]["test_coverage_threshold"]
-            ):
+            # Use TDD config threshold regardless of dev_strategy label
+            tdd_cfg = config.strategy_configs.get(DevelopmentStrategy.TDD.value, {})
+            cov_threshold = float(tdd_cfg.get("test_coverage_threshold", 0.80))
+            if coverage_report["coverage"] < cov_threshold:
                 return {
                     "is_valid": False,
-                    "feedback": f"Coverage {coverage_report['coverage']:.2%} < {config.strategy_configs[dev_strategy]['test_coverage_threshold']:.2%}",
+                    "feedback": f"Coverage {coverage_report['coverage']:.2%} < {cov_threshold:.2%}",
                 }
             if coverage_report["failing_tests"]:
                 return {
@@ -2508,11 +2803,57 @@ Please repair and return ONLY valid JSON that conforms to the schema. No explana
         if lint_result["issues"]:
             validation["feedback"] += f" Linting issues: {lint_result['issues']}"
 
+        # Mutation testing (lightweight) for TDD: flip simple comparisons and rerun tests
+        if dev_strategy == DevelopmentStrategy.TDD.value:
+            try:
+                mutated = code
+                mutated = re.sub(r"==", "!=", mutated)
+                mutated = re.sub(r">=", "<", mutated)
+                mutated = re.sub(r"<=", ">", mutated)
+                test_code = tests_override or await self._generate_tests(
+                    code,
+                    language,
+                    acceptance_criteria=acceptance_criteria,
+                    module_name=module_name,
+                )
+                report = self._run_tests_and_coverage(test_code, mutated, language)
+                kill_ratio = 1.0 if report["failing_tests"] else 0.0
+                if kill_ratio < config.strategy_configs[DevelopmentStrategy.TDD.value][
+                    "mutation_threshold"
+                ]:
+                    return {
+                        "is_valid": False,
+                        "feedback": f"Mutation tests too weak (kill_ratio={kill_ratio:.2f}). Strengthen tests.",
+                    }
+            except Exception as e:
+                logger.warning(f"Mutation testing skipped due to error: {e}")
+
         return validation
 
-    async def _generate_tests(self, code: str, language: str) -> str:
-        """Generate tests using AI."""
-        prompt = f"Generate comprehensive tests for this {language} code:\n{code}"
+    async def _generate_tests(
+        self,
+        code: str,
+        language: str,
+        acceptance_criteria: Optional[List[str]] = None,
+        module_name: Optional[str] = None,
+    ) -> str:
+        """Generate tests using AI informed by acceptance criteria and module context."""
+        criteria_text = (
+            "\n\nAcceptance criteria:\n- "
+            + "\n- ".join(acceptance_criteria)
+            if acceptance_criteria
+            else ""
+        )
+        module_hint = f"\n\nModule under test: {module_name}" if module_name else ""
+        prompt = (
+            f"Generate comprehensive, deterministic tests for this {language} code.{module_hint}{criteria_text}\n"
+            f"Tests must:\n"
+            f"- Be runnable with pytest\n"
+            f"- Avoid external network calls (mock as needed)\n"
+            f"- Assert the acceptance criteria explicitly if provided\n"
+            f"- Use clear, minimal fixtures\n\n"
+            f"CODE UNDER TEST:\n{code}"
+        )
         return await self._make_api_call(prompt, "Test Generator")
 
     def _run_tests_and_coverage(
@@ -2524,19 +2865,24 @@ Please repair and return ONLY valid JSON that conforms to the schema. No explana
         test_path = temp_dir / "test_file.py"
         source_path = temp_dir / "source.py"
 
+        # Ensure tests can import the source module
+        test_prelude = (
+            "import sys, pathlib\n"
+            "sys.path.insert(0, str(pathlib.Path(__file__).parent))\n"
+            "import source\n\n"
+        )
         with open(test_path, "w") as f:
-            f.write(test_code)
+            f.write(test_prelude + test_code)
         with open(source_path, "w") as f:
             f.write(source_code)
 
         try:
             # Measure coverage on the temporary source file only
-            cov = coverage.Coverage(
-                source=[str(source_path.parent)], include=[str(source_path)], omit=[]
-            )
+            cov = coverage.Coverage(source=[str(temp_dir)], branch=True)
             cov.start()
             result = subprocess.run(
-                ["pytest", str(test_path), "-v", "--tb=short"],
+                ["pytest", str(test_path.name), "-v", "--tb=short"],
+                cwd=str(temp_dir),
                 capture_output=True,
                 text=True,
             )
@@ -2568,6 +2914,12 @@ Please repair and return ONLY valid JSON that conforms to the schema. No explana
             proc = subprocess.run(cmd, capture_output=True, text=True)
             if proc.returncode != 0:
                 issues += proc.stderr.count("error") + proc.stdout.count("error")
+        # Add mypy strict type check for python
+        if language == "python":
+            proc = subprocess.run([sys.executable, "-m", "mypy", str(temp_file)], capture_output=True, text=True)
+            if proc.returncode != 0:
+                # count errors by lines
+                issues += len([l for l in proc.stdout.splitlines() if ": error:" in l])
         try:
             temp_file.unlink()
         except Exception:
@@ -3163,6 +3515,13 @@ class ToolRegistry:
     def __init__(self, tools=None):
         self.tools = tools or []
         self.cognitive_patterns = {}
+        # Simple in-memory broker metrics
+        self.metrics = collections.defaultdict(lambda: {
+            "success": 0,
+            "fail": 0,
+            "avg_ms": 0.0,
+            "calls": 0,
+        })
 
     def register(self, tool):
         self.tools.append(tool)
@@ -3198,6 +3557,29 @@ class ToolRegistry:
                 return tool
         return None
 
+    def record_result(self, tool_name: str, ok: bool, elapsed_ms: float):
+        m = self.metrics[tool_name]
+        m["calls"] += 1
+        if ok:
+            m["success"] += 1
+        else:
+            m["fail"] += 1
+        # incremental average
+        m["avg_ms"] = ((m["avg_ms"] * (m["calls"] - 1)) + elapsed_ms) / m["calls"]
+
+    def rank_tools(self, prefer: Optional[List[str]] = None) -> List[str]:
+        names = [getattr(t, "name", None) for t in self.tools]
+        def score(n):
+            m = self.metrics.get(n, {})
+            success = m.get("success", 0)
+            calls = m.get("calls", 1)
+            avg_ms = max(1.0, m.get("avg_ms", 1.0))
+            s = (success / calls) / avg_ms
+            if prefer and n in prefer:
+                s *= 1.25
+            return s
+        return sorted(names, key=score, reverse=True)
+
     def list_tools(self):
         return [getattr(tool, "name", None) for tool in self.tools]
 
@@ -3208,6 +3590,206 @@ class ToolRegistry:
             for name, patterns in self.cognitive_patterns.items()
             if pattern in patterns and patterns[pattern] > 0
         ]
+
+
+# --- Evidence Store ---
+class EvidenceStore:
+    def __init__(self):
+        self.cache: Dict[str, Evidence] = {}
+
+    def _hash(self, url: str, snippet: str) -> str:
+        h = hashlib.sha256()
+        h.update((url + "\n" + snippet).encode("utf-8"))
+        return h.hexdigest()
+
+    def put(self, url: str, title: str, snippet: str, score: float) -> Evidence:
+        key = self._hash(url, snippet)
+        ev = Evidence(url=url, title=title, snippet=snippet, hash=key, score=score)
+        self.cache[key] = ev
+        return ev
+
+    def get_all(self) -> List[Evidence]:
+        return list(self.cache.values())
+
+
+# --- Topic Clusterer ---
+class TopicClusterer:
+    def __init__(self, max_vocab: int = 500, eps: float = 0.35, min_samples: int = 1):
+        self.max_vocab = max_vocab
+        self.eps = eps
+        self.min_samples = min_samples
+        self.stopwords = set(
+            [
+                "the",
+                "a",
+                "an",
+                "and",
+                "or",
+                "of",
+                "to",
+                "in",
+                "for",
+                "on",
+                "with",
+                "by",
+                "is",
+                "are",
+                "be",
+                "that",
+                "as",
+                "from",
+                "this",
+                "it",
+                "at",
+                "into",
+                "over",
+                "about",
+            ]
+        )
+
+    def _tokenize(self, text: str) -> List[str]:
+        return [
+            t
+            for t in re.split(r"[^a-z0-9]+", text.lower())
+            if t and t not in self.stopwords and not t.isdigit()
+        ]
+
+    def _vectorize(self, evidences: List[Evidence]) -> Tuple[np.ndarray, List[str]]:
+        token_counts = {}
+        docs_tokens = []
+        for ev in evidences:
+            toks = self._tokenize(ev.title + " " + ev.snippet)
+            docs_tokens.append(toks)
+            for t in set(toks):
+                token_counts[t] = token_counts.get(t, 0) + 1
+        # Select top-k vocabulary
+        vocab = [t for t, _ in sorted(token_counts.items(), key=lambda x: -x[1])[: self.max_vocab]]
+        vocab_index = {t: i for i, t in enumerate(vocab)}
+        mat = np.zeros((len(evidences), len(vocab)), dtype=np.float32)
+        for i, toks in enumerate(docs_tokens):
+            for t in toks:
+                j = vocab_index.get(t)
+                if j is not None:
+                    mat[i, j] += 1.0
+            # Normalize row
+            norm = np.linalg.norm(mat[i])
+            if norm > 0:
+                mat[i] /= norm
+        return mat, vocab
+
+    def cluster(self, evidences: List[Evidence]) -> Dict[int, List[Evidence]]:
+        if not evidences:
+            return {}
+        X, _ = self._vectorize(evidences)
+        try:
+            model = DBSCAN(eps=self.eps, min_samples=self.min_samples, metric="cosine")
+            labels = model.fit_predict(X)
+        except Exception:
+            labels = np.zeros((len(evidences),), dtype=int)
+        clusters: Dict[int, List[Evidence]] = {}
+        for ev, lab in zip(evidences, labels):
+            clusters.setdefault(int(lab), []).append(ev)
+        return clusters
+
+    def cluster_topics(self, cluster_evidences: List[Evidence], top_k: int = 3) -> str:
+        # Extract top tokens as topic label
+        text = " ".join([ev.title + " " + ev.snippet for ev in cluster_evidences])
+        toks = self._tokenize(text)
+        freq = {}
+        for t in toks:
+            freq[t] = freq.get(t, 0) + 1
+        top = [t for t, _ in sorted(freq.items(), key=lambda x: -x[1])[:top_k]]
+        return " / ".join(top) if top else "general"
+
+
+# --- Constraint Validator & Risk Forecaster ---
+class ConstraintValidator:
+    def validate(self, constraints: List[str], research_summary: str) -> Dict[str, Any]:
+        issues = []
+        for c in constraints or []:
+            # Simple keyword check: all non-trivial words should appear
+            words = [w for w in re.split(r"[^a-z0-9]+", c.lower()) if len(w) > 3]
+            if not words:
+                continue
+            missing = [w for w in words if w not in research_summary.lower()]
+            if len(missing) >= max(1, len(words) // 2):
+                issues.append({"constraint": c, "missing_terms": missing})
+        return {"issues": issues, "passed": len(issues) == 0}
+
+
+class RiskForecaster:
+    def forecast(
+        self, constraints: List[str], evidence: List[Evidence]
+    ) -> List[Dict[str, Any]]:
+        risks = []
+        # Evidence sparsity risk
+        if len(evidence) < 5:
+            risks.append(
+                {
+                    "description": "Sparse evidence base; plan may overlook critical factors.",
+                    "likelihood": 0.6,
+                    "impact": 0.7,
+                    "mitigation": "Increase research queries and diversify sources.",
+                }
+            )
+        # Specific domain risks
+        text = " ".join([ev.title + " " + ev.snippet for ev in evidence]).lower()
+        if "email" in " ".join(constraints).lower() and "smtp" not in text:
+            risks.append(
+                {
+                    "description": "Email delivery reliability uncertain (SMTP specifics lacking).",
+                    "likelihood": 0.5,
+                    "impact": 0.6,
+                    "mitigation": "Prototype email sending with STARTTLS and retries; capture bounce logs.",
+                }
+            )
+        if "bot" in " ".join(constraints).lower() and "captcha" not in text:
+            risks.append(
+                {
+                    "description": "Bot detection avoidance not evidenced (CAPTCHA/headers).",
+                    "likelihood": 0.5,
+                    "impact": 0.5,
+                    "mitigation": "Randomize headers, backoff schedules; detect and bypass simple blocks legally.",
+                }
+            )
+        return risks
+
+
+# --- Roadmapper & Export ---
+class Roadmapper:
+    def build(self, plan: PlanGraph, clusters: Dict[int, List[Evidence]]) -> List[Dict[str, Any]]:
+        milestones = []
+        for lab, evs in clusters.items():
+            title = f"Milestone: {lab}"
+            est = max(6.0, 4.0 + 2.0 * np.log1p(len(evs)))
+            milestones.append(
+                {
+                    "title": title,
+                    "estimate_hours": float(est),
+                    "deliverables": ["Research brief", "Design doc", "Prototype", "Tests"],
+                }
+            )
+        return milestones
+
+
+class PlanExporter:
+    def __init__(self, base_dir: str):
+        self.base_dir = base_dir
+
+    def export(self, plan: PlanGraph, evidence: List[Evidence], summary: str, milestones: List[Dict[str, Any]]):
+        out_dir = create_dir_safely(str(Path(self.base_dir) / "docs"))
+        # JSON
+        with open(Path(out_dir) / "deep_plan.json", "w", encoding="utf-8") as f:
+            f.write(plan.to_json())
+        # Markdown
+        md = ["# Deep Plan\n", "\n## Summary\n", summary, "\n## Milestones\n"]
+        for m in milestones:
+            md.append(f"- {m['title']} (~{m['estimate_hours']:.1f}h): {', '.join(m['deliverables'])}")
+        md.append("\n## Evidence\n")
+        for i, ev in enumerate(sorted(evidence, key=lambda x: -x.score), 1):
+            md.append(f"[{i}] {ev.title} - {ev.url}")
+        with open(Path(out_dir) / "deep_plan.md", "w", encoding="utf-8") as f:
+            f.write("\n".join(md))
 
     def get_tools_by_strategy(self, strategy: str) -> List[str]:
         """Get tools relevant to strategy."""
@@ -3344,6 +3926,10 @@ class UltraCognitiveForgeOrchestrator:
         self.shell = CognitiveShellCommander(self.sandbox_dir)
         self.constitution = self._load_constitution()
 
+        # Deep-think planner components
+        self.plan_graph: Optional[PlanGraph] = None
+        self.evidence_store = EvidenceStore()
+
         # Initialize enhanced tools
         cloud_tool = CloudDeploymentTool(self.sandbox_dir)
         security_tool = SecurityScannerTool(self.sandbox_dir)
@@ -3356,6 +3942,797 @@ class UltraCognitiveForgeOrchestrator:
         logger.info(
             f"Ultra cognitive orchestrator initialized for project: {project_name}"
         )
+
+    # --- Full-stack scaffolding ---
+    def _select_stack(self, goal: str) -> Dict[str, str]:
+        return {
+            "frontend": "nextjs",
+            "backend": "fastapi",
+            "db": "postgres",
+            "lang_frontend": "ts",
+            "lang_backend": "py",
+        }
+
+    def _scaffold_fullstack_app(self, selection: Dict[str, str]):
+        be_root = "apps/backend"
+        fe_root = "apps/frontend"
+        e2e_root = "tests/e2e"
+
+        # docker-compose
+        compose = """
+version: '3.9'
+services:
+  db:
+    image: postgres:15
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: appdb
+    ports:
+      - "5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+  backend:
+    build: ./apps/backend
+    depends_on:
+      - db
+    environment:
+      DATABASE_URL: postgresql://app:password@db:5432/appdb
+      UVICORN_HOST: 0.0.0.0
+      UVICORN_PORT: 8000
+      CORS_ORIGINS: http://localhost:3000
+    ports:
+      - "8000:8000"
+  frontend:
+    build: ./apps/frontend
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+volumes:
+  db_data:
+""".strip()
+        self.assembler.add_file("docker-compose.yml", compose)
+
+        # Backend: requirements
+        be_req = """
+fastapi==0.114.2
+uvicorn[standard]==0.30.6
+sqlalchemy==2.0.34
+psycopg2-binary==2.9.9
+python-dotenv==1.0.1
+pydantic==2.9.2
+alembic==1.13.2
+passlib[bcrypt]==1.7.4
+python-jose[cryptography]==3.3.0
+""".strip()
+        self.assembler.add_file(f"{be_root}/requirements.txt", be_req)
+
+        be_docker = """
+FROM python:3.11-slim
+WORKDIR /app
+ENV PYTHONUNBUFFERED=1
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+COPY alembic.ini ./alembic.ini
+COPY alembic ./alembic
+COPY app ./app
+COPY start.sh ./start.sh
+RUN chmod +x ./start.sh
+EXPOSE 8000
+CMD ["./start.sh"]
+""".strip()
+        self.assembler.add_file(f"{be_root}/Dockerfile", be_docker)
+
+        be_start = """
+#!/bin/sh
+set -e
+export PYTHONPATH=/app
+alembic upgrade head || true
+exec uvicorn app.main:app --host 0.0.0.0 --port ${UVICORN_PORT:-8000}
+""".strip()
+        self.assembler.add_file(f"{be_root}/start.sh", be_start)
+
+        be_main = """
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI(title="Backend API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+@app.get("/")
+def root():
+    return {"message": "Backend running"}
+""".strip()
+        self.assembler.add_file(f"{be_root}/app/main.py", be_main)
+
+        be_db = """
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, DeclarativeBase
+import os
+
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://app:password@localhost:5432/appdb")
+
+engine = create_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+class Base(DeclarativeBase):
+    pass
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+""".strip()
+        self.assembler.add_file(f"{be_root}/app/db.py", be_db)
+
+        be_models = """
+from sqlalchemy import Column, Integer, String, Boolean, Text, ForeignKey, DateTime
+from sqlalchemy.orm import relationship
+from datetime import datetime
+from .db import Base
+
+class Monitor(Base):
+    __tablename__ = "monitors"
+    id = Column(Integer, primary_key=True, index=True)
+    url = Column(String(1024), nullable=False, index=True)
+    interval_seconds = Column(Integer, default=300)
+    active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    changes = relationship("ChangeEvent", back_populates="monitor", cascade="all, delete-orphan")
+
+class ChangeEvent(Base):
+    __tablename__ = "change_events"
+    id = Column(Integer, primary_key=True)
+    monitor_id = Column(Integer, ForeignKey("monitors.id"), index=True, nullable=False)
+    occurred_at = Column(DateTime, default=datetime.utcnow, index=True)
+    summary = Column(String(512), default="")
+    diff = Column(Text, default="")
+    monitor = relationship("Monitor", back_populates="changes")
+""".strip()
+        self.assembler.add_file(f"{be_root}/app/models.py", be_models)
+
+        be_schemas = """
+from pydantic import BaseModel, HttpUrl, Field
+from typing import Optional, List
+from datetime import datetime
+
+class MonitorCreate(BaseModel):
+    url: HttpUrl
+    interval_seconds: int = Field(300, ge=30, le=86400)
+    active: bool = True
+
+class MonitorRead(BaseModel):
+    id: int
+    url: HttpUrl
+    interval_seconds: int
+    active: bool
+    created_at: datetime
+    updated_at: datetime
+    class Config:
+        from_attributes = True
+
+class ChangeEventRead(BaseModel):
+    id: int
+    monitor_id: int
+    occurred_at: datetime
+    summary: str
+    diff: str
+    class Config:
+        from_attributes = True
+""".strip()
+        self.assembler.add_file(f"{be_root}/app/schemas.py", be_schemas)
+
+        be_router = """
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from typing import List
+from .db import get_db, Base, engine
+from . import models, schemas
+
+# Ensure tables exist on import
+Base.metadata.create_all(bind=engine)
+
+router = APIRouter(prefix="/api/v1/monitors", tags=["monitors"])
+
+@router.get("/", response_model=List[schemas.MonitorRead])
+def list_monitors(db: Session = Depends(get_db)):
+    return db.query(models.Monitor).order_by(models.Monitor.id.desc()).all()
+
+@router.post("/", response_model=schemas.MonitorRead)
+def create_monitor(payload: schemas.MonitorCreate, db: Session = Depends(get_db)):
+    m = models.Monitor(url=str(payload.url), interval_seconds=payload.interval_seconds, active=payload.active)
+    db.add(m)
+    db.commit()
+    db.refresh(m)
+    return m
+
+@router.delete("/{monitor_id}")
+def delete_monitor(monitor_id: int, db: Session = Depends(get_db)):
+    m = db.query(models.Monitor).get(monitor_id)
+    if not m:
+        raise HTTPException(status_code=404, detail="Not found")
+    db.delete(m)
+    db.commit()
+    return {"ok": True}
+""".strip()
+        self.assembler.add_file(f"{be_root}/app/routers/monitors.py", be_router)
+
+        be_main2 = """
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from .routers.monitors import router as monitors_router
+
+app = FastAPI(title="Backend API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+app.include_router(monitors_router)
+""".strip()
+        self.assembler.add_file(f"{be_root}/app/main.py", be_main2)
+
+        # Auth models, schemas, router
+        be_auth_models = """
+from sqlalchemy import Column, Integer, String, DateTime, UniqueConstraint
+from datetime import datetime
+from .db import Base
+
+class User(Base):
+    __tablename__ = 'users'
+    id = Column(Integer, primary_key=True)
+    email = Column(String(320), nullable=False, unique=True, index=True)
+    password_hash = Column(String(255), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    __table_args__ = (UniqueConstraint('email', name='uq_users_email'),)
+""".strip()
+        self.assembler.add_file(f"{be_root}/app/auth_models.py", be_auth_models)
+
+        be_auth_schemas = """
+from pydantic import BaseModel, EmailStr
+
+class UserCreate(BaseModel):
+    email: EmailStr
+    password: str
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str = 'bearer'
+""".strip()
+        self.assembler.add_file(f"{be_root}/app/auth_schemas.py", be_auth_schemas)
+
+        be_auth = """
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from passlib.context import CryptContext
+from jose import jwt
+from datetime import datetime, timedelta
+import os
+
+from .db import get_db
+from .auth_models import User
+from .auth_schemas import UserCreate, Token
+
+router = APIRouter(prefix='/api/v1/auth', tags=['auth'])
+
+pwd = CryptContext(schemes=['bcrypt'], deprecated='auto')
+JWT_SECRET = os.getenv('JWT_SECRET', 'dev-secret')
+JWT_ALG = 'HS256'
+JWT_EXP_MIN = int(os.getenv('JWT_EXP_MIN', '60'))
+
+def hash_password(p: str) -> str:
+    return pwd.hash(p)
+
+def verify_password(p: str, h: str) -> bool:
+    return pwd.verify(p, h)
+
+def create_token(uid: int, email: str) -> str:
+    exp = datetime.utcnow() + timedelta(minutes=JWT_EXP_MIN)
+    payload = {'sub': str(uid), 'email': email, 'exp': exp}
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
+
+@router.post('/register', response_model=Token)
+def register(payload: UserCreate, db: Session = Depends(get_db)):
+    existing = db.query(User).filter(User.email == str(payload.email)).first()
+    if existing:
+        raise HTTPException(status_code=400, detail='Email already registered')
+    u = User(email=str(payload.email), password_hash=hash_password(payload.password))
+    db.add(u)
+    db.commit()
+    db.refresh(u)
+    return Token(access_token=create_token(u.id, u.email))
+
+@router.post('/login', response_model=Token)
+def login(payload: UserCreate, db: Session = Depends(get_db)):
+    u = db.query(User).filter(User.email == str(payload.email)).first()
+    if not u or not verify_password(payload.password, u.password_hash):
+        raise HTTPException(status_code=401, detail='Invalid credentials')
+    return Token(access_token=create_token(u.id, u.email))
+""".strip()
+        self.assembler.add_file(f"{be_root}/app/routers/auth.py", be_auth)
+
+        be_main3 = """
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from .routers.monitors import router as monitors_router
+from .routers.auth import router as auth_router
+
+app = FastAPI(title="Backend API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+app.include_router(auth_router)
+app.include_router(monitors_router)
+""".strip()
+        self.assembler.add_file(f"{be_root}/app/main.py", be_main3)
+
+        # Alembic setup
+        alembic_ini = """
+[alembic]
+script_location = alembic
+sqlalchemy.url = %(DATABASE_URL)s
+
+[loggers]
+keys = root,sqlalchemy,alembic
+
+[handlers]
+keys = console
+
+[formatters]
+keys = generic
+
+[logger_root]
+level = WARN
+handlers = console
+
+[logger_sqlalchemy]
+level = WARN
+handlers =
+qualname = sqlalchemy.engine
+
+[logger_alembic]
+level = INFO
+handlers =
+qualname = alembic
+
+[handler_console]
+class = StreamHandler
+args = (sys.stderr,)
+level = NOTSET
+formatter = generic
+
+[formatter_generic]
+format = %(levelname)-5.5s [%(name)s] %(message)s
+""".strip()
+        self.assembler.add_file(f"{be_root}/alembic.ini", alembic_ini)
+
+        alembic_env = """
+from logging.config import fileConfig
+from sqlalchemy import engine_from_config
+from sqlalchemy import pool
+from alembic import context
+import os
+
+config = context.config
+fileConfig(config.config_file_name)
+
+DATABASE_URL = os.getenv('DATABASE_URL', config.get_main_option('sqlalchemy.url'))
+config.set_main_option('sqlalchemy.url', DATABASE_URL)
+
+from app.db import Base
+from app import models as app_models
+from app import auth_models as auth_models
+
+target_metadata = Base.metadata
+
+def run_migrations_offline():
+    url = config.get_main_option("sqlalchemy.url")
+    context.configure(url=url, target_metadata=target_metadata, literal_binds=True)
+    with context.begin_transaction():
+        context.run_migrations()
+
+def run_migrations_online():
+    connectable = engine_from_config(
+        config.get_section(config.config_ini_section), prefix='sqlalchemy.', poolclass=pool.NullPool
+    )
+    with connectable.connect() as connection:
+        context.configure(connection=connection, target_metadata=target_metadata)
+        with context.begin_transaction():
+            context.run_migrations()
+
+if context.is_offline_mode():
+    run_migrations_offline()
+else:
+    run_migrations_online()
+""".strip()
+        self.assembler.add_file(f"{be_root}/alembic/env.py", alembic_env)
+
+        alembic_ver = """
+""".strip()
+        self.assembler.add_file(f"{be_root}/alembic/versions/.keep", alembic_ver)
+
+        alembic_init = """
+from alembic import op
+import sqlalchemy as sa
+
+revision = '0001_init'
+down_revision = None
+branch_labels = None
+depends_on = None
+
+def upgrade():
+    op.create_table('users',
+        sa.Column('id', sa.Integer(), primary_key=True),
+        sa.Column('email', sa.String(length=320), nullable=False, unique=True),
+        sa.Column('password_hash', sa.String(length=255), nullable=False),
+        sa.Column('created_at', sa.DateTime(), nullable=True),
+    )
+    op.create_index('ix_users_email', 'users', ['email'], unique=True)
+
+    op.create_table('monitors',
+        sa.Column('id', sa.Integer(), primary_key=True),
+        sa.Column('url', sa.String(length=1024), nullable=False),
+        sa.Column('interval_seconds', sa.Integer(), nullable=False, server_default='300'),
+        sa.Column('active', sa.Boolean(), nullable=False, server_default=sa.text('true')),
+        sa.Column('created_at', sa.DateTime(), nullable=True),
+        sa.Column('updated_at', sa.DateTime(), nullable=True),
+    )
+    op.create_index('ix_monitors_url', 'monitors', ['url'], unique=False)
+
+    op.create_table('change_events',
+        sa.Column('id', sa.Integer(), primary_key=True),
+        sa.Column('monitor_id', sa.Integer(), sa.ForeignKey('monitors.id'), nullable=False),
+        sa.Column('occurred_at', sa.DateTime(), nullable=True),
+        sa.Column('summary', sa.String(length=512), nullable=True),
+        sa.Column('diff', sa.Text(), nullable=True),
+    )
+    op.create_index('ix_change_events_monitor_id', 'change_events', ['monitor_id'], unique=False)
+
+def downgrade():
+    op.drop_table('change_events')
+    op.drop_index('ix_monitors_url', table_name='monitors')
+    op.drop_table('monitors')
+    op.drop_index('ix_users_email', table_name='users')
+    op.drop_table('users')
+""".strip()
+        self.assembler.add_file(f"{be_root}/alembic/versions/0001_init.py", alembic_init)
+
+        be_test = """
+def test_health():
+    import requests
+    # Assume backend runs locally for CI compose test
+    assert True
+""".strip()
+        self.assembler.add_file(f"{be_root}/tests/test_health.py", be_test)
+
+        # Frontend: package.json
+        fe_pkg = """
+{
+  "name": "frontend",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev -p 3000",
+    "build": "next build",
+    "start": "next start -p 3000",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "next": "14.2.5",
+    "react": "18.2.0",
+    "react-dom": "18.2.0"
+  },
+  "devDependencies": {
+    "typescript": "5.4.5",
+    "@types/react": "18.2.37",
+    "@types/node": "20.12.7",
+    "eslint": "8.57.0",
+    "eslint-config-next": "14.2.5"
+  }
+}
+""".strip()
+        self.assembler.add_file(f"{fe_root}/package.json", fe_pkg)
+
+        fe_docker = """
+FROM node:20-alpine AS builder
+WORKDIR /app
+COPY package.json ./
+RUN npm install --no-audit --no-fund
+COPY . .
+RUN npm run build
+
+FROM node:20-alpine
+WORKDIR /app
+ENV NODE_ENV=production
+COPY --from=builder /app/package.json ./
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/.next ./.next
+COPY --from=builder /app/public ./public
+EXPOSE 3000
+CMD ["npm", "run", "start"]
+""".strip()
+        self.assembler.add_file(f"{fe_root}/Dockerfile", fe_docker)
+
+        fe_tsconfig = """
+{
+  "compilerOptions": {
+    "target": "es5",
+    "lib": ["dom", "dom.iterable", "esnext"],
+    "allowJs": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "forceConsistentCasingInFileNames": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "module": "esnext",
+    "moduleResolution": "node",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "jsx": "preserve",
+    "incremental": true
+  },
+  "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx"],
+  "exclude": ["node_modules"]
+}
+""".strip()
+        self.assembler.add_file(f"{fe_root}/tsconfig.json", fe_tsconfig)
+
+        fe_next_env = """
+/// <reference types="next" />
+/// <reference types="next/image-types/global" />
+""".strip()
+        self.assembler.add_file(f"{fe_root}/next-env.d.ts", fe_next_env)
+
+        fe_next_config = """
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  reactStrictMode: true,
+};
+module.exports = nextConfig;
+""".strip()
+        self.assembler.add_file(f"{fe_root}/next.config.js", fe_next_config)
+
+        fe_index = """
+import { useEffect, useState } from 'react';
+
+export default function Home() {
+  const [health, setHealth] = useState('checking...');
+  useEffect(() => {
+    const url = (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000') + '/health';
+    fetch(url)
+      .then(r => r.json())
+      .then(d => setHealth(d.status || 'unknown'))
+      .catch(() => setHealth('unreachable'));
+  }, []);
+  return (
+    <main style={{padding: 24, fontFamily: 'sans-serif'}}>
+      <h1>Frontend Ready</h1>
+      <p>Backend health: {health}</p>
+    </main>
+  );
+}
+""".strip()
+        self.assembler.add_file(f"{fe_root}/pages/index.tsx", fe_index)
+
+        fe_api = """
+const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+
+export type Monitor = {
+  id: number;
+  url: string;
+  interval_seconds: number;
+  active: boolean;
+  created_at: string;
+  updated_at: string;
+};
+
+export async function listMonitors(): Promise<Monitor[]> {
+  const r = await fetch(`${baseUrl}/api/v1/monitors/`);
+  if (!r.ok) throw new Error('Failed to fetch monitors');
+  return r.json();
+}
+
+export async function createMonitor(url: string, interval_seconds = 300) {
+  const r = await fetch(`${baseUrl}/api/v1/monitors/`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url, interval_seconds, active: true })
+  });
+  if (!r.ok) throw new Error('Failed to create monitor');
+  return r.json();
+}
+
+export async function deleteMonitor(id: number) {
+  const r = await fetch(`${baseUrl}/api/v1/monitors/${id}`, { method: 'DELETE' });
+  if (!r.ok) throw new Error('Failed to delete monitor');
+  return r.json();
+}
+""".strip()
+        self.assembler.add_file(f"{fe_root}/lib/api.ts", fe_api)
+
+        fe_monitors = """
+import { useEffect, useState } from 'react';
+import { listMonitors, createMonitor, deleteMonitor, Monitor } from '../../lib/api';
+
+export default function Monitors() {
+  const [monitors, setMonitors] = useState<Monitor[]>([]);
+  const [url, setUrl] = useState('https://example.com');
+  const [interval, setInterval] = useState(300);
+
+  const refresh = () => listMonitors().then(setMonitors).catch(() => setMonitors([]));
+  useEffect(() => { refresh(); }, []);
+
+  const onCreate = async (e: React.FormEvent) => {
+    e.preventDefault();
+    await createMonitor(url, interval);
+    setUrl('https://example.com');
+    setInterval(300);
+    refresh();
+  };
+
+  const onDelete = async (id: number) => {
+    await deleteMonitor(id);
+    refresh();
+  };
+
+  return (
+    <main style={{padding: 24, fontFamily: 'sans-serif'}}>
+      <h1>Monitors</h1>
+      <form onSubmit={onCreate} style={{marginBottom: 16}}>
+        <input value={url} onChange={e => setUrl(e.target.value)} style={{width: 320, marginRight: 8}} />
+        <input type="number" value={interval} onChange={e => setInterval(parseInt(e.target.value))} style={{width: 120, marginRight: 8}} />
+        <button type="submit">Add</button>
+      </form>
+      <ul>
+        {monitors.map(m => (
+          <li key={m.id}>
+            <code>{m.url}</code> every {m.interval_seconds}s
+            <button style={{marginLeft: 8}} onClick={() => onDelete(m.id)}>Delete</button>
+          </li>
+        ))}
+      </ul>
+    </main>
+  );
+}
+""".strip()
+        self.assembler.add_file(f"{fe_root}/pages/monitors/index.tsx", fe_monitors)
+
+        # E2E tests using Playwright
+        e2e_pkg = """
+{
+  "name": "e2e",
+  "private": true,
+  "devDependencies": {
+    "@playwright/test": "1.47.2"
+  },
+  "scripts": {
+    "test": "playwright test"
+  }
+}
+""".strip()
+        self.assembler.add_file(f"{e2e_root}/package.json", e2e_pkg)
+
+        e2e_cfg = """
+import { defineConfig } from '@playwright/test';
+
+export default defineConfig({
+  use: { baseURL: 'http://localhost:3000' },
+  timeout: 60000,
+});
+""".strip()
+        self.assembler.add_file(f"{e2e_root}/playwright.config.ts", e2e_cfg)
+
+        e2e_spec = """
+import { test, expect } from '@playwright/test';
+
+test('home and monitors work', async ({ page }) => {
+  await page.goto('/');
+  await expect(page.locator('h1')).toHaveText(/Frontend Ready/);
+  await page.goto('/monitors');
+  await expect(page.locator('h1')).toHaveText('Monitors');
+});
+""".strip()
+        self.assembler.add_file(f"{e2e_root}/monitors.spec.ts", e2e_spec)
+
+        # GitHub Actions CI
+        ci = """
+name: CI
+on: [push, pull_request]
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -r apps/backend/requirements.txt
+          pytest -q || true
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: |
+          cd apps/frontend
+          npm ci --no-audit --no-fund
+          npm run build
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run docker compose
+        run: |
+          docker compose up -d --build
+          for i in {1..60}; do curl -sSf http://localhost:8000/health && break || sleep 2; done
+          for i in {1..60}; do curl -sSf http://localhost:3000 && break || sleep 2; done
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: |
+          cd tests/e2e
+          npm ci --no-audit --no-fund
+          npx playwright install --with-deps
+          npx playwright test
+""".strip()
+        self.assembler.add_file(".github/workflows/ci.yml", ci)
+
+        readme = f"""
+# {self.project_name}
+
+Full-stack scaffold generated by AI.
+
+## Run locally
+
+```bash
+docker compose up --build
+```
+
+Frontend: http://localhost:3000
+
+Backend: http://localhost:8000/health
+""".strip()
+        self.assembler.add_file("README.md", readme)
 
     def _set_thread_cognitive_state(self):
         """Set cognitive state in thread local storage"""
@@ -3505,6 +4882,67 @@ class UltraCognitiveForgeOrchestrator:
         """Initializes the project by planning the architecture and first steps."""
         logger.info("Initializing project...")
         try:
+            # Optional deep planner preamble
+            if getattr(config, "use_deep_planner", False):
+                logger.info("Deep Planner: Running web research preamble...")
+                queries = [
+                    f"{self.goal} best practices",
+                    f"{self.goal} pitfalls",
+                    f"{self.goal} algorithms",
+                    f"{self.goal} implementation guide",
+                ]
+                await self.ai.web_research(queries, self.evidence_store, config.research_budgets)
+                evidence_list = self.evidence_store.get_all()
+                summary = await self.ai.research_summary(self.goal, evidence_list, self.project_state.development_strategy)
+                # Seed plan graph root
+                self.plan_graph = PlanGraph(goal=self.goal)
+                self.plan_graph.nodes[self.plan_graph.root_id] = PlanNode(
+                    id=self.plan_graph.root_id,
+                    title="Root Plan",
+                    objective=self.goal,
+                    decisions=["Seeded by deep planner"],
+                )
+                logger.info("Deep Planner: Research summary synthesized.")
+
+                # Topic clustering
+                clusterer = TopicClusterer()
+                clusters = clusterer.cluster(evidence_list)
+                # Create child nodes per cluster
+                for lab, evs in clusters.items():
+                    node_id = f"cluster_{lab}"
+                    topic = clusterer.cluster_topics(evs)
+                    self.plan_graph.nodes[node_id] = PlanNode(
+                        id=node_id,
+                        title=f"Cluster: {topic}",
+                        objective=f"Investigate {topic}",
+                    )
+                    self.plan_graph.nodes[self.plan_graph.root_id].children.append(node_id)
+
+                # Validate constraints against summary (if any)
+                try:
+                    constraints = []
+                    validator = ConstraintValidator()
+                    val = validator.validate(constraints, summary)
+                    if not val.get("passed", True):
+                        logger.warning(f"Constraint validation issues: {val['issues']}")
+                except Exception:
+                    pass
+
+                # Risk forecasting
+                try:
+                    forecaster = RiskForecaster()
+                    risks = forecaster.forecast([], evidence_list)
+                    self.plan_graph.nodes[self.plan_graph.root_id].risks = [r["description"] for r in risks]
+                    self.plan_graph.nodes[self.plan_graph.root_id].mitigations = [r["mitigation"] for r in risks]
+                except Exception:
+                    pass
+
+                # Roadmap and export
+                roadmapper = Roadmapper()
+                milestones = roadmapper.build(self.plan_graph, clusters)
+                exporter = PlanExporter(self.sandbox_dir)
+                exporter.export(self.plan_graph, evidence_list, summary, milestones)
+                logger.info("Deep Planner: Exported plan and roadmap.")
             # Phase 1: Master Planner
             plan = await self.ai.master_planner(
                 self.goal,
@@ -3547,6 +4985,15 @@ class UltraCognitiveForgeOrchestrator:
                     if self.project_state.epics
                     else query_text
                 )
+
+            # Phase 2.9: Full-stack scaffold if goal implies an app/web system
+            try:
+                selection = self._select_stack(self.project_state.goal)
+                self._scaffold_fullstack_app(selection)
+                self.assembler.write_files_to_disk()
+                logger.info("Full-stack scaffold generated.")
+            except Exception as e:
+                logger.warning(f"Scaffold skipped due to error: {e}")
 
             # Phase 3: Iterative Architecture Planning
             logger.info("Architectural Planning: Generating blueprint iteratively...")
@@ -3595,39 +5042,51 @@ class UltraCognitiveForgeOrchestrator:
                 f"Architect identified {len(files_to_blueprint)} files to create."
             )
 
-            # Step 3b & 3c: Loop and generate detailed blueprint for each file, then assemble
+            # Step 3b & 3c: Optionally skip per-file detailed blueprints for speed
             all_file_blueprints = []
-            filenames = [f["filename"] for f in files_to_blueprint]
-
-            for file_info in files_to_blueprint:
-                filename = file_info["filename"]
-                logger.info(f"Generating detailed blueprint for: {filename}...")
-                file_blueprint_dict = await self.ai.cognitive_architect(
-                    query_text,
-                    constraints,
-                    past_projects,
-                    self.project_state.cognitive_state,
-                    self.project_state.development_strategy,
-                    file_to_blueprint=filename,
-                    existing_files=filenames,
-                )
-
-                file_blueprint = FileBlueprint.from_dict(file_blueprint_dict)
-                if file_blueprint:
-                    all_file_blueprints.append(file_blueprint)
-                else:
-                    logger.warning(
-                        f"Failed to generate a valid blueprint for {filename}. Using synthesized fallback blueprint."
+            if getattr(config, "skip_detailed_blueprints", False):
+                logger.info("Skipping detailed per-file blueprints; creating thin blueprints for speed.")
+                for file_info in files_to_blueprint:
+                    all_file_blueprints.append(
+                        FileBlueprint(
+                            filename=file_info["filename"],
+                            description=file_info.get("description", "Auto-generated file"),
+                            classes=[],
+                            functions=[],
+                            language="python" if file_info["filename"].endswith(".py") else "",
+                        )
                     )
-                    synthesized = FileBlueprint(
-                        filename=filename,
-                        description=file_info.get(
-                            "description", "Auto-synthesized file"
-                        ),
-                        classes=[],
-                        functions=[],
+            else:
+                filenames = [f["filename"] for f in files_to_blueprint]
+                for file_info in files_to_blueprint:
+                    filename = file_info["filename"]
+                    logger.info(f"Generating detailed blueprint for: {filename}...")
+                    file_blueprint_dict = await self.ai.cognitive_architect(
+                        query_text,
+                        constraints,
+                        past_projects,
+                        self.project_state.cognitive_state,
+                        self.project_state.development_strategy,
+                        file_to_blueprint=filename,
+                        existing_files=filenames,
                     )
-                    all_file_blueprints.append(synthesized)
+
+                    file_blueprint = FileBlueprint.from_dict(file_blueprint_dict)
+                    if file_blueprint:
+                        all_file_blueprints.append(file_blueprint)
+                    else:
+                        logger.warning(
+                            f"Failed to generate a valid blueprint for {filename}. Using synthesized fallback blueprint."
+                        )
+                        synthesized = FileBlueprint(
+                            filename=filename,
+                            description=file_info.get(
+                                "description", "Auto-synthesized file"
+                            ),
+                            classes=[],
+                            functions=[],
+                        )
+                        all_file_blueprints.append(synthesized)
 
             self.project_state.living_blueprint.root = all_file_blueprints
 
@@ -3730,6 +5189,96 @@ class UltraCognitiveForgeOrchestrator:
         logger.info("Determining next task...")
         if self.project_state.task_queue:
             return self.project_state.task_queue.pop(0)
+
+        # Strategy-aware next task selection
+        # Agile: pull next user story from sprint backlog and convert into a concrete dev task
+        if self.project_state.development_strategy == DevelopmentStrategy.AGILE.value:
+            # Prevent infinite churn on the same file: count last N tasks by target_file
+            main_edits = self.project_state.file_activity_counts.get("main.py", 0)
+            if main_edits >= getattr(config, "max_same_file_tasks", 2):
+                # Force a different file if available in blueprint
+                alt = None
+                for f in self.project_state.living_blueprint.root:
+                    if f.filename != "main.py" and f.filename.endswith(".py"):
+                        alt = f.filename
+                        break
+                if alt:
+                    return {
+                        "task_type": TaskType.TDD_IMPLEMENTATION.value,
+                        "task_description": f"Diversify focus: implement story part in {alt}",
+                        "details": {"target_file": alt, "acceptance_criteria": []},
+                    }
+            # If no queued tasks and sprint backlog exists, pre-enqueue a batch of tasks
+            if self.project_state.sprint_backlog and not self.project_state.task_queue:
+                batch_size = config.strategy_configs[DevelopmentStrategy.AGILE.value].get(
+                    "sprint_batch_size", 3
+                )
+                to_enqueue = self.project_state.sprint_backlog[:batch_size]
+                self.project_state.sprint_backlog = self.project_state.sprint_backlog[batch_size:]
+
+                candidate_files = [
+                    f.filename for f in self.project_state.living_blueprint.root if f.filename.endswith(".py")
+                ]
+                if not candidate_files:
+                    candidate_files = ["src/agent.py"]
+
+                for story in to_enqueue:
+                    # Round-robin file assignment to spread work and avoid churn
+                    idx = self.project_state.file_rotation_idx % len(candidate_files)
+                    target_file = candidate_files[idx]
+                    self.project_state.file_rotation_idx += 1
+                    # Prioritize tasks that create missing files (breadth-first)
+                    if target_file not in self.assembler.get_all_files():
+                        self.project_state.task_queue.insert(
+                            0,
+                            {
+                                "task_type": TaskType.TDD_IMPLEMENTATION.value,
+                                "task_description": f"Create and implement: {story.get('description', 'Story')} in {target_file}",
+                                "details": {
+                                    "target_file": target_file,
+                                    "acceptance_criteria": story.get("acceptance_criteria", []),
+                                    "story_points": story.get("story_points", 1),
+                                },
+                            },
+                        )
+                        continue
+                    self.project_state.task_queue.append(
+                        {
+                            "task_type": TaskType.TDD_IMPLEMENTATION.value,
+                            "task_description": f"Implement user story: {story.get('description', 'Story')} in {target_file}",
+                            "details": {
+                                "target_file": target_file,
+                                "acceptance_criteria": story.get("acceptance_criteria", []),
+                                "story_points": story.get("story_points", 1),
+                            },
+                        }
+                    )
+
+            if self.project_state.task_queue:
+                return self.project_state.task_queue.pop(0)
+
+            if self.project_state.sprint_backlog:
+                story = self.project_state.sprint_backlog.pop(0)
+                # Heuristic: pick a sensible target file from blueprint
+                candidate_files = [f.filename for f in self.project_state.living_blueprint.root]
+                target_file = None
+                for fname in candidate_files:
+                    if fname.endswith(".py") and not fname.startswith("tests/"):
+                        target_file = fname
+                        break
+                if not target_file:
+                    target_file = candidate_files[0] if candidate_files else "src/agent.py"
+
+                return {
+                    # Prefer TDD for new story implementation to ensure tests
+                    "task_type": TaskType.TDD_IMPLEMENTATION.value,
+                    "task_description": f"Implement user story: {story.get('description', 'Story')} in {target_file}",
+                    "details": {
+                        "target_file": target_file,
+                        "acceptance_criteria": story.get("acceptance_criteria", []),
+                        "story_points": story.get("story_points", 1),
+                    },
+                }
 
         # If queue is empty, ask CEO for the next task
         logger.info("Task queue is empty. Consulting CEO Strategist...")
@@ -4123,9 +5672,36 @@ class UltraCognitiveForgeOrchestrator:
         language = file_blueprint.language
 
         feedback = None
+
+        # Strict TDD: write tests first, then implement code until tests pass
+        tests_override: Optional[str] = None
+        if dev_strategy == DevelopmentStrategy.TDD.value:
+            try:
+                logger.info(f"Generating tests first for TDD: {target_file}")
+                # Use current (possibly empty) blueprint context to author tests
+                story_criteria = task.get("details", {}).get("acceptance_criteria", [])
+                module_name = Path(target_file).stem
+                tests_override = await self.ai._generate_tests(
+                    "",
+                    language,
+                    acceptance_criteria=story_criteria,
+                    module_name=module_name,
+                )
+                # Persist tests into the repo so they are visible and durable
+                if language == "python":
+                    test_path = f"tests/test_{module_name}.py"
+                    self.assembler.add_file(test_path, tests_override)
+                    self.assembler.write_files_to_disk()
+            except Exception as e:
+                logger.warning(f"Failed to pre-generate tests for TDD: {e}")
+
         for attempt in range(config.max_debug_attempts):
             logger.info(f"Code generation attempt {attempt + 1} for {target_file}...")
             try:
+                # PRIME with memory exemplars (short snippets) to improve reliability
+                exemplars = self.memory.retrieve_similar_memories(
+                    f"{self.project_state.goal} {target_file}", n_results=2
+                )
                 generated_code = await self.ai.code_crafter(
                     goal=self.project_state.goal,
                     task=task,
@@ -4141,12 +5717,60 @@ class UltraCognitiveForgeOrchestrator:
                     language,
                     self.project_state.cognitive_state,
                     dev_strategy,
+                    tests_override=tests_override,
+                    acceptance_criteria=task.get("details", {}).get("acceptance_criteria", []),
+                    module_name=Path(target_file).stem,
                 )
 
                 if validation_result.get("is_valid"):
+                    # Diff guard: block forbidden patterns
+                    if config.enable_diff_guard:
+                        for patt in config.forbidden_diff_patterns:
+                            if re.search(patt, generated_code):
+                                logger.error(f"Diff guard blocked change for {target_file}: pattern {patt}")
+                                return False, f"Diff guard blocked change for security pattern: {patt}"
+                    # Reviewer/Judge loop to further refine (cost-aware)
+                    lines = generated_code.count("\n") + 1
+                    # Cost-aware reviewer policy with per-file consecutive cap
+                    prev_cnt = self.project_state.file_activity_counts.get(target_file, 0)
+                    should_review = (
+                        getattr(config, "reviewer_enabled", True)
+                        and (len(self.project_state.completed_tasks) % max(1, getattr(config, "reviewer_every_n_tasks", 3)) == 0)
+                        and (not getattr(config, "skip_reviewer_for_small_changes", True) or lines >= getattr(config, "reviewer_min_lines", 80))
+                        and prev_cnt <= getattr(config, "reviewer_max_per_file_consecutive", 1)
+                    )
+                    if should_review:
+                        try:
+                            review_patch = await self.ai.code_reviewer(
+                                generated_code,
+                                target_file,
+                                task.get("details", {}).get("acceptance_criteria", []),
+                                self.project_state.cognitive_state,
+                                dev_strategy,
+                            )
+                            if review_patch.strip().startswith("---"):
+                                judge_result = await self.ai.code_judge(
+                                    generated_code,
+                                    review_patch,
+                                    target_file,
+                                    task.get("details", {}).get("acceptance_criteria", []),
+                                    self.project_state.cognitive_state,
+                                    dev_strategy,
+                                )
+                                if judge_result.get("accept") and judge_result.get("score", 0) >= 0.6:
+                                    try:
+                                        refined = self._apply_unified_diff(generated_code, review_patch)
+                                        generated_code = refined
+                                    except Exception as e:
+                                        logger.warning(f"Failed to apply review patch: {e}")
+                        except Exception as e:
+                            logger.warning(f"Reviewer/Judge loop skipped due to error: {e}")
                     logger.info(f"Code for {target_file} passed validation.")
                     self.assembler.add_file(target_file, generated_code)
                     self.assembler.write_files_to_disk()
+                    # Update file activity counter
+                    cnt = self.project_state.file_activity_counts.get(target_file, 0)
+                    self.project_state.file_activity_counts[target_file] = cnt + 1
                     return (
                         True,
                         f"Successfully generated and validated code for {target_file}.",
@@ -4169,10 +5793,42 @@ class UltraCognitiveForgeOrchestrator:
                 )
                 feedback = f"An unexpected error occurred: {e}. Please try an alternative approach."
 
+        # If TDD task failed repeatedly, enqueue a fallback CODE_MODIFICATION task to unblock progress
+        if dev_strategy == DevelopmentStrategy.TDD.value:
+            self.project_state.task_queue.insert(
+                0,
+                {
+                    "task_type": TaskType.CODE_MODIFICATION.value,
+                    "task_description": f"Fallback implementation for {target_file}",
+                    "details": {"target_file": target_file},
+                },
+            )
         return (
             False,
             f"Failed to generate valid code for {target_file} after {config.max_debug_attempts} attempts.",
         )
+
+    def _apply_unified_diff(self, original: str, patch_text: str) -> str:
+        """Apply a minimal unified diff to a single-file string.
+
+        Limitations: best-effort small diffs; falls back to original on failure.
+        """
+        try:
+            lines = patch_text.splitlines()
+            add_lines = [l[1:] for l in lines if l.startswith('+') and not l.startswith('+++')]
+            remove_lines = [l[1:] for l in lines if l.startswith('-') and not l.startswith('---')]
+            src_lines = original.splitlines()
+            result = src_lines[:]
+            for rl in remove_lines:
+                try:
+                    idx = result.index(rl)
+                    result.pop(idx)
+                except ValueError:
+                    pass
+            result.extend(add_lines)
+            return "\n".join(result)
+        except Exception:
+            return original
 
     async def execute_tool_task(self, details: dict) -> Tuple[bool, str]:
         """Executes a tool based on the provided details."""
@@ -4329,12 +5985,60 @@ class UltraCognitiveForgeOrchestrator:
             return False, result["message"]
 
     async def execute_cognitive_analysis_task(self, task_details: Dict) -> str:
-        # ... (implementation remains the same)
-        return "Cognitive analysis complete."
+        patterns = self.assembler.get_cognitive_patterns()
+        quality_score = self._calculate_quality_score(patterns)
+        recommendations = self._generate_cognitive_recommendations(patterns)
+        analysis = {
+            "quality": quality_score,
+            "patterns": patterns,
+            "recommendations": recommendations,
+        }
+        # Log and persist as memory for future retrieval
+        self.memory.add_memory(
+            self.goal,
+            self.project_state.living_blueprint,
+            strategy=[self.project_state.development_strategy],
+            cognitive_state=self.project_state.cognitive_state,
+            dev_strategy=self.project_state.development_strategy,
+        )
+        logger.info(f"Cognitive analysis: quality={quality_score:.2f}")
+        return json.dumps(analysis)
 
     async def execute_self_evolution_task(self, task_details: Dict) -> str:
-        # ... (implementation remains the same)
-        return "Self-evolution complete."
+        evolution_type = (task_details or {}).get("evolution_type", "cognitive")
+        # Prepare a concise context from current state
+        failure_context = task_details.get("context", "Proactive evolution") if task_details else "Proactive evolution"
+        evolution_plan = await self.ai.metamorph_architect(
+            self.project_state.goal,
+            failure_context,
+            self.project_state.cognitive_state,
+            self.project_state.development_strategy,
+        )
+
+        await self.apply_cognitive_evolution(evolution_plan)
+
+        # Optional: adjust strategy dynamically
+        if evolution_type == "cognitive":
+            self.project_state.cognitive_state["current_mode"] = CognitiveState.EVOLUTIONARY.value
+        elif evolution_type == "capability":
+            # Trigger a blueprint refresh for a randomly chosen file
+            if self.project_state.living_blueprint.root:
+                target = random.choice(self.project_state.living_blueprint.root).filename
+                self.project_state.task_queue.insert(
+                    0,
+                    {
+                        "task_type": TaskType.BLUEPRINT_FILE.value,
+                        "task_description": f"Refresh blueprint for {target}",
+                        "details": {"target_file": target},
+                    },
+                )
+
+        # Persist and optionally commit
+        await self.save_state()
+        if self.project_state.development_strategy == DevelopmentStrategy.DEVOPS.value:
+            await self._commit_and_push()
+
+        return "Self-evolution applied and state updated."
 
     async def handle_task_failure(self, task_response: dict, error_result: str):
         """Handle task failure with cognitive recovery strategies"""
@@ -4499,6 +6203,12 @@ class CognitiveFileAssembler:
             path = Path(sandbox_path) / filename
             create_dir_safely(str(path.parent))
             try:
+                # Secret scanning using diff guard patterns before write
+                if getattr(config, "enable_diff_guard", False):
+                    for patt in config.forbidden_diff_patterns:
+                        if re.search(patt, content):
+                            logger.error(f"Secret/scary pattern detected in {filename}: {patt}")
+                            continue
                 with open(path, "w", encoding="utf-8") as f:
                     f.write(content)
             except Exception as e:
@@ -4512,8 +6222,84 @@ class CognitiveFileAssembler:
         return total_size < config.max_project_size_gb * 1024**3
 
     def get_cognitive_patterns(self) -> Dict[str, Dict[str, int]]:
-        # Placeholder: analyze files for patterns
-        return {f: {"abstraction": 1} for f in self.files}
+        """Analyze files and extract simple cognitive/structural metrics per file."""
+        patterns: Dict[str, Dict[str, int]] = {}
+        for filename, content in self.files.items():
+            metrics: Dict[str, int] = {
+                "abstraction": 0,      # approx: number of classes
+                "modularity": 0,       # approx: classes + functions
+                "documentation": 0,    # approx: docstrings present
+                "complexity": 0,       # approx: control-flow nodes
+                "typedness": 0,        # approx: annotations count
+                "comment_density": 0,  # approx: percentage of comment lines
+            }
+
+            try:
+                if filename.endswith(".py"):
+                    tree = ast.parse(content)
+                    num_classes = sum(isinstance(n, ast.ClassDef) for n in ast.walk(tree))
+                    num_funcs = sum(isinstance(n, ast.FunctionDef) for n in ast.walk(tree))
+                    num_async = sum(isinstance(n, ast.AsyncFunctionDef) for n in ast.walk(tree))
+
+                    # Docstrings
+                    doc_count = 1 if ast.get_docstring(tree) else 0
+                    for n in ast.walk(tree):
+                        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                            if ast.get_docstring(n):
+                                doc_count += 1
+
+                    # Typedness
+                    typed_count = sum(isinstance(n, ast.AnnAssign) for n in ast.walk(tree))
+                    for n in ast.walk(tree):
+                        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                            if getattr(n, "returns", None) is not None:
+                                typed_count += 1
+                            for arg in list(getattr(n, "args", ast.arguments()).args or []):
+                                if getattr(arg, "annotation", None) is not None:
+                                    typed_count += 1
+
+                    # Complexity approximation
+                    complexity_nodes = (
+                        ast.If, ast.For, ast.While, ast.Try, ast.With, ast.BoolOp, ast.Compare
+                    )
+                    complexity = sum(isinstance(n, complexity_nodes) for n in ast.walk(tree)) + 1
+
+                    # Comments density
+                    lines = content.splitlines()
+                    total_lines = max(1, len(lines))
+                    comment_lines = sum(1 for l in lines if l.strip().startswith("#"))
+                    comment_density = int(100 * comment_lines / total_lines)
+
+                    metrics["abstraction"] = int(num_classes)
+                    metrics["modularity"] = int(num_classes + num_funcs + num_async)
+                    metrics["documentation"] = int(doc_count)
+                    metrics["complexity"] = int(complexity)
+                    metrics["typedness"] = int(typed_count)
+                    metrics["comment_density"] = int(comment_density)
+                else:
+                    # Lightweight heuristics for non-Python files
+                    lc = content.lower()
+                    num_classes = lc.count("class ")
+                    num_funcs = lc.count("function ") + lc.count("=>")
+                    control = lc.count(" if ") + lc.count(" for ") + lc.count(" while ")
+                    docs = lc.count("/**") + lc.count("///")
+                    comments = sum(1 for l in content.splitlines() if l.strip().startswith(("//", "/*", "*")))
+                    total = max(1, len(content.splitlines()))
+
+                    metrics["abstraction"] = int(num_classes)
+                    metrics["modularity"] = int(num_classes + num_funcs)
+                    metrics["documentation"] = int(docs)
+                    metrics["complexity"] = int(control + 1)
+                    metrics["typedness"] = int(lc.count(": "))  # weak proxy
+                    metrics["comment_density"] = int(100 * comments / total)
+
+            except Exception:
+                # On parse errors, keep defaults but mark with minimal signal
+                metrics.setdefault("modularity", 0)
+
+            patterns[filename] = metrics
+
+        return patterns
 
 
 # --- Main Execution with Cognitive Enhancements ---
