@@ -445,13 +445,17 @@ class NeuromorphicMemory:
     def _setup_indexes(self):
         """Setup multiple indexing strategies for different use cases"""
         if faiss is not None:
-            # Primary FAISS index for fast similarity search
-            self.memory_indexes['flat'] = faiss.IndexFlatIP(self.memory_dim)
-            self.memory_indexes['hnsw'] = faiss.IndexHNSWFlat(self.memory_dim, 32)
-            self.memory_indexes['ivf'] = faiss.IndexIVFFlat(self.memory_indexes['flat'], self.memory_dim, 100)
+            try:
+                # Primary FAISS index for fast similarity search
+                self.memory_indexes['flat'] = faiss.IndexFlatIP(self.memory_dim)
+                self.memory_indexes['hnsw'] = faiss.IndexHNSWFlat(self.memory_dim, 32)
+                self.memory_indexes['ivf'] = faiss.IndexIVFFlat(self.memory_indexes['flat'], self.memory_dim, 100)
 
-            # Quantized index for memory efficiency
-            self.memory_indexes['pq'] = faiss.IndexPQ(self.memory_dim, 8, 8)
+                # Quantized index for memory efficiency
+                self.memory_indexes['pq'] = faiss.IndexPQ(self.memory_dim, 8, 8)
+                logger.info("FAISS indexes initialized successfully")
+            except Exception as e:
+                logger.warning(f"FAISS index initialization failed: {e}. Using fallback indexes only.")
 
         # Local fallback indexes
         class _AdvancedLocalIndex:
@@ -2018,7 +2022,7 @@ class NeuromorphicMemoryManager:
                 "chromadb is not installed. Long-term memory will be disabled."
             )
         except Exception as e:
-            logger.error(f"Failed to initialize memory: {str(e)}")
+            logger.warning(f"Failed to initialize Chromadb: {e}. Memory operations will use fallback mode.")
 
     def add_memory(
         self,
@@ -2030,7 +2034,8 @@ class NeuromorphicMemoryManager:
         cognitive_state: Dict = None,
         dev_strategy: str = None,
     ):
-        if "project_blueprints" not in self.collections:
+        if "project_blueprints" not in self.collections or self.client is None:
+            logger.debug("Memory storage unavailable, skipping memory addition")
             return
 
         try:
@@ -2108,9 +2113,11 @@ class NeuromorphicMemoryManager:
         self, query: str, n_results: int = 5, collection: str = "project_blueprints"
     ) -> list:
         if (
-            collection not in self.collections
+            self.client is None
+            or collection not in self.collections
             or self.collections[collection].count() == 0
         ):
+            logger.debug(f"Memory retrieval unavailable for collection: {collection}")
             return []
 
         try:
@@ -2129,9 +2136,11 @@ class NeuromorphicMemoryManager:
         collection: str = "project_blueprints",
     ) -> list:
         if (
-            collection not in self.collections
+            self.client is None
+            or collection not in self.collections
             or self.collections[collection].count() == 0
         ):
+            logger.debug(f"Memory retrieval unavailable for collection: {collection}")
             return []
 
         try:
