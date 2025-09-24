@@ -3956,6 +3956,7 @@ class UltraCognitiveForgeOrchestrator:
     def _scaffold_fullstack_app(self, selection: Dict[str, str]):
         be_root = "apps/backend"
         fe_root = "apps/frontend"
+        e2e_root = "tests/e2e"
 
         # docker-compose
         compose = """
@@ -4042,6 +4043,144 @@ def root():
     return {"message": "Backend running"}
 """.strip()
         self.assembler.add_file(f"{be_root}/app/main.py", be_main)
+
+        be_db = """
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, DeclarativeBase
+import os
+
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://app:password@localhost:5432/appdb")
+
+engine = create_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+class Base(DeclarativeBase):
+    pass
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+""".strip()
+        self.assembler.add_file(f"{be_root}/app/db.py", be_db)
+
+        be_models = """
+from sqlalchemy import Column, Integer, String, Boolean, Text, ForeignKey, DateTime
+from sqlalchemy.orm import relationship
+from datetime import datetime
+from .db import Base
+
+class Monitor(Base):
+    __tablename__ = "monitors"
+    id = Column(Integer, primary_key=True, index=True)
+    url = Column(String(1024), nullable=False, index=True)
+    interval_seconds = Column(Integer, default=300)
+    active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    changes = relationship("ChangeEvent", back_populates="monitor", cascade="all, delete-orphan")
+
+class ChangeEvent(Base):
+    __tablename__ = "change_events"
+    id = Column(Integer, primary_key=True)
+    monitor_id = Column(Integer, ForeignKey("monitors.id"), index=True, nullable=False)
+    occurred_at = Column(DateTime, default=datetime.utcnow, index=True)
+    summary = Column(String(512), default="")
+    diff = Column(Text, default="")
+    monitor = relationship("Monitor", back_populates="changes")
+""".strip()
+        self.assembler.add_file(f"{be_root}/app/models.py", be_models)
+
+        be_schemas = """
+from pydantic import BaseModel, HttpUrl, Field
+from typing import Optional, List
+from datetime import datetime
+
+class MonitorCreate(BaseModel):
+    url: HttpUrl
+    interval_seconds: int = Field(300, ge=30, le=86400)
+    active: bool = True
+
+class MonitorRead(BaseModel):
+    id: int
+    url: HttpUrl
+    interval_seconds: int
+    active: bool
+    created_at: datetime
+    updated_at: datetime
+    class Config:
+        from_attributes = True
+
+class ChangeEventRead(BaseModel):
+    id: int
+    monitor_id: int
+    occurred_at: datetime
+    summary: str
+    diff: str
+    class Config:
+        from_attributes = True
+""".strip()
+        self.assembler.add_file(f"{be_root}/app/schemas.py", be_schemas)
+
+        be_router = """
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from typing import List
+from .db import get_db, Base, engine
+from . import models, schemas
+
+# Ensure tables exist on import
+Base.metadata.create_all(bind=engine)
+
+router = APIRouter(prefix="/api/v1/monitors", tags=["monitors"])
+
+@router.get("/", response_model=List[schemas.MonitorRead])
+def list_monitors(db: Session = Depends(get_db)):
+    return db.query(models.Monitor).order_by(models.Monitor.id.desc()).all()
+
+@router.post("/", response_model=schemas.MonitorRead)
+def create_monitor(payload: schemas.MonitorCreate, db: Session = Depends(get_db)):
+    m = models.Monitor(url=str(payload.url), interval_seconds=payload.interval_seconds, active=payload.active)
+    db.add(m)
+    db.commit()
+    db.refresh(m)
+    return m
+
+@router.delete("/{monitor_id}")
+def delete_monitor(monitor_id: int, db: Session = Depends(get_db)):
+    m = db.query(models.Monitor).get(monitor_id)
+    if not m:
+        raise HTTPException(status_code=404, detail="Not found")
+    db.delete(m)
+    db.commit()
+    return {"ok": True}
+""".strip()
+        self.assembler.add_file(f"{be_root}/app/routers/monitors.py", be_router)
+
+        be_main2 = """
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from .routers.monitors import router as monitors_router
+
+app = FastAPI(title="Backend API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+app.include_router(monitors_router)
+""".strip()
+        self.assembler.add_file(f"{be_root}/app/main.py", be_main2)
 
         be_test = """
 def test_health():
@@ -4151,6 +4290,126 @@ export default function Home() {
 """.strip()
         self.assembler.add_file(f"{fe_root}/pages/index.tsx", fe_index)
 
+        fe_api = """
+const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+
+export type Monitor = {
+  id: number;
+  url: string;
+  interval_seconds: number;
+  active: boolean;
+  created_at: string;
+  updated_at: string;
+};
+
+export async function listMonitors(): Promise<Monitor[]> {
+  const r = await fetch(`${baseUrl}/api/v1/monitors/`);
+  if (!r.ok) throw new Error('Failed to fetch monitors');
+  return r.json();
+}
+
+export async function createMonitor(url: string, interval_seconds = 300) {
+  const r = await fetch(`${baseUrl}/api/v1/monitors/`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url, interval_seconds, active: true })
+  });
+  if (!r.ok) throw new Error('Failed to create monitor');
+  return r.json();
+}
+
+export async function deleteMonitor(id: number) {
+  const r = await fetch(`${baseUrl}/api/v1/monitors/${id}`, { method: 'DELETE' });
+  if (!r.ok) throw new Error('Failed to delete monitor');
+  return r.json();
+}
+""".strip()
+        self.assembler.add_file(f"{fe_root}/lib/api.ts", fe_api)
+
+        fe_monitors = """
+import { useEffect, useState } from 'react';
+import { listMonitors, createMonitor, deleteMonitor, Monitor } from '../../lib/api';
+
+export default function Monitors() {
+  const [monitors, setMonitors] = useState<Monitor[]>([]);
+  const [url, setUrl] = useState('https://example.com');
+  const [interval, setInterval] = useState(300);
+
+  const refresh = () => listMonitors().then(setMonitors).catch(() => setMonitors([]));
+  useEffect(() => { refresh(); }, []);
+
+  const onCreate = async (e: React.FormEvent) => {
+    e.preventDefault();
+    await createMonitor(url, interval);
+    setUrl('https://example.com');
+    setInterval(300);
+    refresh();
+  };
+
+  const onDelete = async (id: number) => {
+    await deleteMonitor(id);
+    refresh();
+  };
+
+  return (
+    <main style={{padding: 24, fontFamily: 'sans-serif'}}>
+      <h1>Monitors</h1>
+      <form onSubmit={onCreate} style={{marginBottom: 16}}>
+        <input value={url} onChange={e => setUrl(e.target.value)} style={{width: 320, marginRight: 8}} />
+        <input type="number" value={interval} onChange={e => setInterval(parseInt(e.target.value))} style={{width: 120, marginRight: 8}} />
+        <button type="submit">Add</button>
+      </form>
+      <ul>
+        {monitors.map(m => (
+          <li key={m.id}>
+            <code>{m.url}</code> every {m.interval_seconds}s
+            <button style={{marginLeft: 8}} onClick={() => onDelete(m.id)}>Delete</button>
+          </li>
+        ))}
+      </ul>
+    </main>
+  );
+}
+""".strip()
+        self.assembler.add_file(f"{fe_root}/pages/monitors/index.tsx", fe_monitors)
+
+        # E2E tests using Playwright
+        e2e_pkg = """
+{
+  "name": "e2e",
+  "private": true,
+  "devDependencies": {
+    "@playwright/test": "1.47.2"
+  },
+  "scripts": {
+    "test": "playwright test"
+  }
+}
+""".strip()
+        self.assembler.add_file(f"{e2e_root}/package.json", e2e_pkg)
+
+        e2e_cfg = """
+import { defineConfig } from '@playwright/test';
+
+export default defineConfig({
+  use: { baseURL: 'http://localhost:3000' },
+  timeout: 60000,
+});
+""".strip()
+        self.assembler.add_file(f"{e2e_root}/playwright.config.ts", e2e_cfg)
+
+        e2e_spec = """
+import { test, expect } from '@playwright/test';
+
+test('home and monitors work', async ({ page }) => {
+  await page.goto('/');
+  await expect(page.locator('h1')).toHaveText(/Frontend Ready/);
+  await page.goto('/monitors');
+  await expect(page.locator('h1')).toHaveText('Monitors');
+});
+""".strip()
+        self.assembler.add_file(f"{e2e_root}/monitors.spec.ts", e2e_spec)
+
         # GitHub Actions CI
         ci = """
 name: CI
@@ -4178,6 +4437,23 @@ jobs:
           cd apps/frontend
           npm ci --no-audit --no-fund
           npm run build
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run docker compose
+        run: |
+          docker compose up -d --build
+          for i in {1..60}; do curl -sSf http://localhost:8000/health && break || sleep 2; done
+          for i in {1..60}; do curl -sSf http://localhost:3000 && break || sleep 2; done
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: |
+          cd tests/e2e
+          npm ci --no-audit --no-fund
+          npx playwright install --with-deps
+          npx playwright test
 """.strip()
         self.assembler.add_file(".github/workflows/ci.yml", ci)
 
