@@ -531,6 +531,12 @@ class Config:
             "fetch_timeout_s": 20,
             "concurrency": 5,
         }
+        # Cost controls for Agile
+        self.reviewer_enabled = True
+        self.reviewer_every_n_tasks = 3
+        self.reviewer_min_lines = 80
+        self.skip_reviewer_for_small_changes = True
+        self.max_same_file_tasks = 2
 
         # Language configs with enhanced TDD support
         self.language_configs["python"]["test_command"] = (
@@ -4383,6 +4389,25 @@ class UltraCognitiveForgeOrchestrator:
         # Strategy-aware next task selection
         # Agile: pull next user story from sprint backlog and convert into a concrete dev task
         if self.project_state.development_strategy == DevelopmentStrategy.AGILE.value:
+            # Prevent infinite churn on the same file: count last N tasks by target_file
+            recent = self.project_state.completed_tasks[-10:]
+            same_file_count = 0
+            for t in recent:
+                if isinstance(t, str) and "main.py" in t:
+                    same_file_count += 1
+            if same_file_count >= getattr(config, "max_same_file_tasks", 2):
+                # Force a different file if available in blueprint
+                alt = None
+                for f in self.project_state.living_blueprint.root:
+                    if f.filename != "main.py" and f.filename.endswith(".py"):
+                        alt = f.filename
+                        break
+                if alt:
+                    return {
+                        "task_type": TaskType.TDD_IMPLEMENTATION.value,
+                        "task_description": f"Diversify focus: implement story part in {alt}",
+                        "details": {"target_file": alt, "acceptance_criteria": []},
+                    }
             # If no queued tasks and sprint backlog exists, pre-enqueue a batch of tasks
             if self.project_state.sprint_backlog and not self.project_state.task_queue:
                 batch_size = config.strategy_configs[DevelopmentStrategy.AGILE.value].get(
@@ -4889,32 +4914,39 @@ class UltraCognitiveForgeOrchestrator:
                             if re.search(patt, generated_code):
                                 logger.error(f"Diff guard blocked change for {target_file}: pattern {patt}")
                                 return False, f"Diff guard blocked change for security pattern: {patt}"
-                    # Reviewer/Judge loop to further refine
-                    try:
-                        review_patch = await self.ai.code_reviewer(
-                            generated_code,
-                            target_file,
-                            task.get("details", {}).get("acceptance_criteria", []),
-                            self.project_state.cognitive_state,
-                            dev_strategy,
-                        )
-                        if review_patch.strip().startswith("---"):
-                            judge_result = await self.ai.code_judge(
+                    # Reviewer/Judge loop to further refine (cost-aware)
+                    lines = generated_code.count("\n") + 1
+                    should_review = (
+                        getattr(config, "reviewer_enabled", True)
+                        and (len(self.project_state.completed_tasks) % max(1, getattr(config, "reviewer_every_n_tasks", 3)) == 0)
+                        and (not getattr(config, "skip_reviewer_for_small_changes", True) or lines >= getattr(config, "reviewer_min_lines", 80))
+                    )
+                    if should_review:
+                        try:
+                            review_patch = await self.ai.code_reviewer(
                                 generated_code,
-                                review_patch,
                                 target_file,
                                 task.get("details", {}).get("acceptance_criteria", []),
                                 self.project_state.cognitive_state,
                                 dev_strategy,
                             )
-                            if judge_result.get("accept") and judge_result.get("score", 0) >= 0.6:
-                                try:
-                                    refined = self._apply_unified_diff(generated_code, review_patch)
-                                    generated_code = refined
-                                except Exception as e:
-                                    logger.warning(f"Failed to apply review patch: {e}")
-                    except Exception as e:
-                        logger.warning(f"Reviewer/Judge loop skipped due to error: {e}")
+                            if review_patch.strip().startswith("---"):
+                                judge_result = await self.ai.code_judge(
+                                    generated_code,
+                                    review_patch,
+                                    target_file,
+                                    task.get("details", {}).get("acceptance_criteria", []),
+                                    self.project_state.cognitive_state,
+                                    dev_strategy,
+                                )
+                                if judge_result.get("accept") and judge_result.get("score", 0) >= 0.6:
+                                    try:
+                                        refined = self._apply_unified_diff(generated_code, review_patch)
+                                        generated_code = refined
+                                    except Exception as e:
+                                        logger.warning(f"Failed to apply review patch: {e}")
+                        except Exception as e:
+                            logger.warning(f"Reviewer/Judge loop skipped due to error: {e}")
                     logger.info(f"Code for {target_file} passed validation.")
                     self.assembler.add_file(target_file, generated_code)
                     self.assembler.write_files_to_disk()
