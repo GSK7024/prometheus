@@ -1357,6 +1357,7 @@ class ProjectState:
     metacognition_log: List[Dict] = field(default_factory=list)  # New
     # File activity tracking to avoid churn
     file_activity_counts: Dict[str, int] = field(default_factory=dict)
+    file_rotation_idx: int = 0
 
     def __post_init__(self):
         if not self.living_blueprint:
@@ -4414,17 +4415,17 @@ class UltraCognitiveForgeOrchestrator:
                 to_enqueue = self.project_state.sprint_backlog[:batch_size]
                 self.project_state.sprint_backlog = self.project_state.sprint_backlog[batch_size:]
 
-                candidate_files = [f.filename for f in self.project_state.living_blueprint.root]
-                default_target = None
-                for fname in candidate_files:
-                    if fname.endswith(".py") and not fname.startswith("tests/"):
-                        default_target = fname
-                        break
-                if not default_target:
-                    default_target = candidate_files[0] if candidate_files else "src/agent.py"
+                candidate_files = [
+                    f.filename for f in self.project_state.living_blueprint.root if f.filename.endswith(".py")
+                ]
+                if not candidate_files:
+                    candidate_files = ["src/agent.py"]
 
                 for story in to_enqueue:
-                    target_file = default_target
+                    # Round-robin file assignment to spread work and avoid churn
+                    idx = self.project_state.file_rotation_idx % len(candidate_files)
+                    target_file = candidate_files[idx]
+                    self.project_state.file_rotation_idx += 1
                     self.project_state.task_queue.append(
                         {
                             "task_type": TaskType.TDD_IMPLEMENTATION.value,
