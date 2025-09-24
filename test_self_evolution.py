@@ -9,6 +9,7 @@ import sys
 import json
 import time
 import ast
+import shutil
 from pathlib import Path
 from typing import Dict, List, Optional
 from enum import Enum
@@ -26,8 +27,14 @@ logger = MockLogger()
 class LearningDatabase:
     """Simplified learning database for demonstration"""
 
-    def __init__(self, db_path="test_learnings.json"):
+    def __init__(self, db_path=None):
+        # Use cross-platform path for the learning database
+        if db_path is None:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            db_path = os.path.join(script_dir, "test_learnings.json")
+
         self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.learnings = []
         self.failures = []
         self.load_data()
@@ -112,7 +119,13 @@ class LearningDatabase:
 class SourceCodeAnalyzer:
     """Simplified source code analyzer for demonstration"""
 
-    def __init__(self, source_file="/workspace/prometheus.py"):
+    def __init__(self, source_file=None):
+        # Use the actual path of the current script, works cross-platform
+        if source_file is None:
+            import os
+            # Get the directory where this script is located
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            source_file = os.path.join(script_dir, "prometheus.py")
         self.source_file = source_file
         self.functions = []
         self.complexity_metrics = {}
@@ -232,14 +245,17 @@ class SelfEvolutionManager:
             'skipped': []
         }
 
-        # Create backup
-        backup_path = f"/workspace/prometheus_backup_demo.py"
+        # Create backup with cross-platform paths
+        import os
+        import shutil
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        backup_path = os.path.join(script_dir, "prometheus_backup_demo.py")
+        source_path = os.path.join(script_dir, "prometheus.py")
         try:
-            import shutil
-            shutil.copy2("/workspace/prometheus.py", backup_path)
+            shutil.copy2(source_path, backup_path)
             logger.info(f"✅ Created backup: {backup_path}")
-        except:
-            logger.warning("Could not create backup")
+        except Exception as e:
+            logger.warning(f"Could not create backup: {e}")
 
         # Simulate improvements
         for improvement in evolution_plan['priority_improvements'][:2]:  # Limit to 2 for demo

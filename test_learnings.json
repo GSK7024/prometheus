@@ -21,6 +21,28 @@
       "outcome": "Generated working code",
       "improvement_notes": "Code generation accuracy improved with better context",
       "timestamp": 1758703731.318396
+    },
+    {
+      "id": "learning_2",
+      "operation": "TASK_EXECUTION",
+      "context": {
+        "strategy": "cognitive",
+        "duration": 2.5
+      },
+      "outcome": "Task completed successfully",
+      "improvement_notes": "Cognitive strategy worked well for this task",
+      "timestamp": 1758705372.517405
+    },
+    {
+      "id": "learning_3",
+      "operation": "CODE_GENERATION",
+      "context": {
+        "language": "python",
+        "lines": 150
+      },
+      "outcome": "Generated working code",
+      "improvement_notes": "Code generation accuracy improved with better context",
+      "timestamp": 1758705372.5238566
     }
   ],
   "failures": [
@@ -36,7 +58,20 @@
       "resolution": "",
       "timestamp": 1758703731.317881,
       "resolved": false
+    },
+    {
+      "id": "failure_1",
+      "operation": "API_CALL",
+      "context": {
+        "endpoint": "/api/generate",
+        "timeout": 30
+      },
+      "error": "Timeout after 30 seconds",
+      "solution_attempted": "Increased timeout to 60s",
+      "resolution": "",
+      "timestamp": 1758705372.5180237,
+      "resolved": false
     }
   ],
-  "last_updated": 1758703731.318399
+  "last_updated": 1758705372.523868
 }

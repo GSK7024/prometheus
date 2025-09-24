@@ -4912,7 +4912,13 @@ class MultimodalFusionEngine:
 class LearningDatabase:
     """Database for storing successful operations and failures"""
 
-    def __init__(self, db_path="self_evolution/learnings.json"):
+    def __init__(self, db_path=None):
+        # Use cross-platform path for the learning database
+        if db_path is None:
+            import os
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            db_path = os.path.join(script_dir, "self_evolution", "learnings.json")
+
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.learnings = []
@@ -5076,7 +5082,13 @@ class LearningDatabase:
 class SourceCodeAnalyzer:
     """Analyze the system's own source code for evolution opportunities"""
 
-    def __init__(self, source_file="/workspace/prometheus.py"):
+    def __init__(self, source_file=None):
+        # Use the actual path of the current script, works cross-platform
+        if source_file is None:
+            import os
+            # Get the directory where this script is located
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            source_file = os.path.join(script_dir, os.path.basename(__file__))
         self.source_file = source_file
         self.ast_tree = None
         self.functions = []
@@ -5294,9 +5306,17 @@ class SelfEvolutionManager:
         """Execute the evolution plan"""
         logger.info("🚀 Starting self-evolution process...")
 
-        # Create backup
-        backup_path = f"/workspace/prometheus_backup_v{self.current_version.replace('.', '_')}.py"
-        shutil.copy2("/workspace/prometheus.py", backup_path)
+        # Create backup with cross-platform paths
+        import os
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        backup_filename = f"prometheus_backup_v{self.current_version.replace('.', '_')}.py"
+        backup_path = os.path.join(script_dir, backup_filename)
+        source_path = os.path.join(script_dir, os.path.basename(__file__))
+        try:
+            shutil.copy2(source_path, backup_path)
+        except Exception as e:
+            logger.warning(f"Failed to create backup: {e}")
+            # Continue without backup if it fails
         logger.info(f"✅ Created backup: {backup_path}")
 
         # Execute improvements
