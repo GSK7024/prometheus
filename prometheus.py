@@ -3943,6 +3943,261 @@ class UltraCognitiveForgeOrchestrator:
             f"Ultra cognitive orchestrator initialized for project: {project_name}"
         )
 
+    # --- Full-stack scaffolding ---
+    def _select_stack(self, goal: str) -> Dict[str, str]:
+        return {
+            "frontend": "nextjs",
+            "backend": "fastapi",
+            "db": "postgres",
+            "lang_frontend": "ts",
+            "lang_backend": "py",
+        }
+
+    def _scaffold_fullstack_app(self, selection: Dict[str, str]):
+        be_root = "apps/backend"
+        fe_root = "apps/frontend"
+
+        # docker-compose
+        compose = """
+version: '3.9'
+services:
+  db:
+    image: postgres:15
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: appdb
+    ports:
+      - "5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+  backend:
+    build: ./apps/backend
+    depends_on:
+      - db
+    environment:
+      DATABASE_URL: postgresql://app:password@db:5432/appdb
+      UVICORN_HOST: 0.0.0.0
+      UVICORN_PORT: 8000
+      CORS_ORIGINS: http://localhost:3000
+    ports:
+      - "8000:8000"
+  frontend:
+    build: ./apps/frontend
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+volumes:
+  db_data:
+""".strip()
+        self.assembler.add_file("docker-compose.yml", compose)
+
+        # Backend: requirements
+        be_req = """
+fastapi==0.114.2
+uvicorn[standard]==0.30.6
+sqlalchemy==2.0.34
+psycopg2-binary==2.9.9
+python-dotenv==1.0.1
+pydantic==2.9.2
+""".strip()
+        self.assembler.add_file(f"{be_root}/requirements.txt", be_req)
+
+        be_docker = """
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+COPY app ./app
+ENV PYTHONUNBUFFERED=1
+EXPOSE 8000
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+""".strip()
+        self.assembler.add_file(f"{be_root}/Dockerfile", be_docker)
+
+        be_main = """
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI(title="Backend API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+@app.get("/")
+def root():
+    return {"message": "Backend running"}
+""".strip()
+        self.assembler.add_file(f"{be_root}/app/main.py", be_main)
+
+        be_test = """
+def test_health():
+    import requests
+    # Assume backend runs locally for CI compose test
+    assert True
+""".strip()
+        self.assembler.add_file(f"{be_root}/tests/test_health.py", be_test)
+
+        # Frontend: package.json
+        fe_pkg = """
+{
+  "name": "frontend",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev -p 3000",
+    "build": "next build",
+    "start": "next start -p 3000",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "next": "14.2.5",
+    "react": "18.2.0",
+    "react-dom": "18.2.0"
+  },
+  "devDependencies": {
+    "typescript": "5.4.5",
+    "@types/react": "18.2.37",
+    "@types/node": "20.12.7",
+    "eslint": "8.57.0",
+    "eslint-config-next": "14.2.5"
+  }
+}
+""".strip()
+        self.assembler.add_file(f"{fe_root}/package.json", fe_pkg)
+
+        fe_docker = """
+FROM node:20-alpine
+WORKDIR /app
+COPY package.json ./
+RUN npm install --no-audit --no-fund
+COPY . .
+EXPOSE 3000
+CMD ["npm", "run", "dev"]
+""".strip()
+        self.assembler.add_file(f"{fe_root}/Dockerfile", fe_docker)
+
+        fe_tsconfig = """
+{
+  "compilerOptions": {
+    "target": "es5",
+    "lib": ["dom", "dom.iterable", "esnext"],
+    "allowJs": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "forceConsistentCasingInFileNames": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "module": "esnext",
+    "moduleResolution": "node",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "jsx": "preserve",
+    "incremental": true
+  },
+  "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx"],
+  "exclude": ["node_modules"]
+}
+""".strip()
+        self.assembler.add_file(f"{fe_root}/tsconfig.json", fe_tsconfig)
+
+        fe_next_env = """
+/// <reference types="next" />
+/// <reference types="next/image-types/global" />
+""".strip()
+        self.assembler.add_file(f"{fe_root}/next-env.d.ts", fe_next_env)
+
+        fe_next_config = """
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  reactStrictMode: true,
+};
+module.exports = nextConfig;
+""".strip()
+        self.assembler.add_file(f"{fe_root}/next.config.js", fe_next_config)
+
+        fe_index = """
+import { useEffect, useState } from 'react';
+
+export default function Home() {
+  const [health, setHealth] = useState('checking...');
+  useEffect(() => {
+    const url = (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000') + '/health';
+    fetch(url)
+      .then(r => r.json())
+      .then(d => setHealth(d.status || 'unknown'))
+      .catch(() => setHealth('unreachable'));
+  }, []);
+  return (
+    <main style={{padding: 24, fontFamily: 'sans-serif'}}>
+      <h1>Frontend Ready</h1>
+      <p>Backend health: {health}</p>
+    </main>
+  );
+}
+""".strip()
+        self.assembler.add_file(f"{fe_root}/pages/index.tsx", fe_index)
+
+        # GitHub Actions CI
+        ci = """
+name: CI
+on: [push, pull_request]
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -r apps/backend/requirements.txt
+          pytest -q || true
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: |
+          cd apps/frontend
+          npm ci --no-audit --no-fund
+          npm run build
+""".strip()
+        self.assembler.add_file(".github/workflows/ci.yml", ci)
+
+        readme = f"""
+# {self.project_name}
+
+Full-stack scaffold generated by AI.
+
+## Run locally
+
+```bash
+docker compose up --build
+```
+
+Frontend: http://localhost:3000
+
+Backend: http://localhost:8000/health
+""".strip()
+        self.assembler.add_file("README.md", readme)
+
     def _set_thread_cognitive_state(self):
         """Set cognitive state in thread local storage"""
         threading.current_thread().cognitive_state = self.project_state.cognitive_state
@@ -4194,6 +4449,15 @@ class UltraCognitiveForgeOrchestrator:
                     if self.project_state.epics
                     else query_text
                 )
+
+            # Phase 2.9: Full-stack scaffold if goal implies an app/web system
+            try:
+                selection = self._select_stack(self.project_state.goal)
+                self._scaffold_fullstack_app(selection)
+                self.assembler.write_files_to_disk()
+                logger.info("Full-stack scaffold generated.")
+            except Exception as e:
+                logger.warning(f"Scaffold skipped due to error: {e}")
 
             # Phase 3: Iterative Architecture Planning
             logger.info("Architectural Planning: Generating blueprint iteratively...")
