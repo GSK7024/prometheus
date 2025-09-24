@@ -4005,20 +4005,36 @@ sqlalchemy==2.0.34
 psycopg2-binary==2.9.9
 python-dotenv==1.0.1
 pydantic==2.9.2
+alembic==1.13.2
+passlib[bcrypt]==1.7.4
+python-jose[cryptography]==3.3.0
 """.strip()
         self.assembler.add_file(f"{be_root}/requirements.txt", be_req)
 
         be_docker = """
 FROM python:3.11-slim
 WORKDIR /app
+ENV PYTHONUNBUFFERED=1
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
+COPY alembic.ini ./alembic.ini
+COPY alembic ./alembic
 COPY app ./app
-ENV PYTHONUNBUFFERED=1
+COPY start.sh ./start.sh
+RUN chmod +x ./start.sh
 EXPOSE 8000
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["./start.sh"]
 """.strip()
         self.assembler.add_file(f"{be_root}/Dockerfile", be_docker)
+
+        be_start = """
+#!/bin/sh
+set -e
+export PYTHONPATH=/app
+alembic upgrade head || true
+exec uvicorn app.main:app --host 0.0.0.0 --port ${UVICORN_PORT:-8000}
+""".strip()
+        self.assembler.add_file(f"{be_root}/start.sh", be_start)
 
         be_main = """
 from fastapi import FastAPI
@@ -4182,6 +4198,241 @@ app.include_router(monitors_router)
 """.strip()
         self.assembler.add_file(f"{be_root}/app/main.py", be_main2)
 
+        # Auth models, schemas, router
+        be_auth_models = """
+from sqlalchemy import Column, Integer, String, DateTime, UniqueConstraint
+from datetime import datetime
+from .db import Base
+
+class User(Base):
+    __tablename__ = 'users'
+    id = Column(Integer, primary_key=True)
+    email = Column(String(320), nullable=False, unique=True, index=True)
+    password_hash = Column(String(255), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    __table_args__ = (UniqueConstraint('email', name='uq_users_email'),)
+""".strip()
+        self.assembler.add_file(f"{be_root}/app/auth_models.py", be_auth_models)
+
+        be_auth_schemas = """
+from pydantic import BaseModel, EmailStr
+
+class UserCreate(BaseModel):
+    email: EmailStr
+    password: str
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str = 'bearer'
+""".strip()
+        self.assembler.add_file(f"{be_root}/app/auth_schemas.py", be_auth_schemas)
+
+        be_auth = """
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from passlib.context import CryptContext
+from jose import jwt
+from datetime import datetime, timedelta
+import os
+
+from .db import get_db
+from .auth_models import User
+from .auth_schemas import UserCreate, Token
+
+router = APIRouter(prefix='/api/v1/auth', tags=['auth'])
+
+pwd = CryptContext(schemes=['bcrypt'], deprecated='auto')
+JWT_SECRET = os.getenv('JWT_SECRET', 'dev-secret')
+JWT_ALG = 'HS256'
+JWT_EXP_MIN = int(os.getenv('JWT_EXP_MIN', '60'))
+
+def hash_password(p: str) -> str:
+    return pwd.hash(p)
+
+def verify_password(p: str, h: str) -> bool:
+    return pwd.verify(p, h)
+
+def create_token(uid: int, email: str) -> str:
+    exp = datetime.utcnow() + timedelta(minutes=JWT_EXP_MIN)
+    payload = {'sub': str(uid), 'email': email, 'exp': exp}
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
+
+@router.post('/register', response_model=Token)
+def register(payload: UserCreate, db: Session = Depends(get_db)):
+    existing = db.query(User).filter(User.email == str(payload.email)).first()
+    if existing:
+        raise HTTPException(status_code=400, detail='Email already registered')
+    u = User(email=str(payload.email), password_hash=hash_password(payload.password))
+    db.add(u)
+    db.commit()
+    db.refresh(u)
+    return Token(access_token=create_token(u.id, u.email))
+
+@router.post('/login', response_model=Token)
+def login(payload: UserCreate, db: Session = Depends(get_db)):
+    u = db.query(User).filter(User.email == str(payload.email)).first()
+    if not u or not verify_password(payload.password, u.password_hash):
+        raise HTTPException(status_code=401, detail='Invalid credentials')
+    return Token(access_token=create_token(u.id, u.email))
+""".strip()
+        self.assembler.add_file(f"{be_root}/app/routers/auth.py", be_auth)
+
+        be_main3 = """
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from .routers.monitors import router as monitors_router
+from .routers.auth import router as auth_router
+
+app = FastAPI(title="Backend API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+app.include_router(auth_router)
+app.include_router(monitors_router)
+""".strip()
+        self.assembler.add_file(f"{be_root}/app/main.py", be_main3)
+
+        # Alembic setup
+        alembic_ini = """
+[alembic]
+script_location = alembic
+sqlalchemy.url = %(DATABASE_URL)s
+
+[loggers]
+keys = root,sqlalchemy,alembic
+
+[handlers]
+keys = console
+
+[formatters]
+keys = generic
+
+[logger_root]
+level = WARN
+handlers = console
+
+[logger_sqlalchemy]
+level = WARN
+handlers =
+qualname = sqlalchemy.engine
+
+[logger_alembic]
+level = INFO
+handlers =
+qualname = alembic
+
+[handler_console]
+class = StreamHandler
+args = (sys.stderr,)
+level = NOTSET
+formatter = generic
+
+[formatter_generic]
+format = %(levelname)-5.5s [%(name)s] %(message)s
+""".strip()
+        self.assembler.add_file(f"{be_root}/alembic.ini", alembic_ini)
+
+        alembic_env = """
+from logging.config import fileConfig
+from sqlalchemy import engine_from_config
+from sqlalchemy import pool
+from alembic import context
+import os
+
+config = context.config
+fileConfig(config.config_file_name)
+
+DATABASE_URL = os.getenv('DATABASE_URL', config.get_main_option('sqlalchemy.url'))
+config.set_main_option('sqlalchemy.url', DATABASE_URL)
+
+from app.db import Base
+from app import models as app_models
+from app import auth_models as auth_models
+
+target_metadata = Base.metadata
+
+def run_migrations_offline():
+    url = config.get_main_option("sqlalchemy.url")
+    context.configure(url=url, target_metadata=target_metadata, literal_binds=True)
+    with context.begin_transaction():
+        context.run_migrations()
+
+def run_migrations_online():
+    connectable = engine_from_config(
+        config.get_section(config.config_ini_section), prefix='sqlalchemy.', poolclass=pool.NullPool
+    )
+    with connectable.connect() as connection:
+        context.configure(connection=connection, target_metadata=target_metadata)
+        with context.begin_transaction():
+            context.run_migrations()
+
+if context.is_offline_mode():
+    run_migrations_offline()
+else:
+    run_migrations_online()
+""".strip()
+        self.assembler.add_file(f"{be_root}/alembic/env.py", alembic_env)
+
+        alembic_ver = """
+""".strip()
+        self.assembler.add_file(f"{be_root}/alembic/versions/.keep", alembic_ver)
+
+        alembic_init = """
+from alembic import op
+import sqlalchemy as sa
+
+revision = '0001_init'
+down_revision = None
+branch_labels = None
+depends_on = None
+
+def upgrade():
+    op.create_table('users',
+        sa.Column('id', sa.Integer(), primary_key=True),
+        sa.Column('email', sa.String(length=320), nullable=False, unique=True),
+        sa.Column('password_hash', sa.String(length=255), nullable=False),
+        sa.Column('created_at', sa.DateTime(), nullable=True),
+    )
+    op.create_index('ix_users_email', 'users', ['email'], unique=True)
+
+    op.create_table('monitors',
+        sa.Column('id', sa.Integer(), primary_key=True),
+        sa.Column('url', sa.String(length=1024), nullable=False),
+        sa.Column('interval_seconds', sa.Integer(), nullable=False, server_default='300'),
+        sa.Column('active', sa.Boolean(), nullable=False, server_default=sa.text('true')),
+        sa.Column('created_at', sa.DateTime(), nullable=True),
+        sa.Column('updated_at', sa.DateTime(), nullable=True),
+    )
+    op.create_index('ix_monitors_url', 'monitors', ['url'], unique=False)
+
+    op.create_table('change_events',
+        sa.Column('id', sa.Integer(), primary_key=True),
+        sa.Column('monitor_id', sa.Integer(), sa.ForeignKey('monitors.id'), nullable=False),
+        sa.Column('occurred_at', sa.DateTime(), nullable=True),
+        sa.Column('summary', sa.String(length=512), nullable=True),
+        sa.Column('diff', sa.Text(), nullable=True),
+    )
+    op.create_index('ix_change_events_monitor_id', 'change_events', ['monitor_id'], unique=False)
+
+def downgrade():
+    op.drop_table('change_events')
+    op.drop_index('ix_monitors_url', table_name='monitors')
+    op.drop_table('monitors')
+    op.drop_index('ix_users_email', table_name='users')
+    op.drop_table('users')
+""".strip()
+        self.assembler.add_file(f"{be_root}/alembic/versions/0001_init.py", alembic_init)
+
         be_test = """
 def test_health():
     import requests
@@ -4219,13 +4470,22 @@ def test_health():
         self.assembler.add_file(f"{fe_root}/package.json", fe_pkg)
 
         fe_docker = """
-FROM node:20-alpine
+FROM node:20-alpine AS builder
 WORKDIR /app
 COPY package.json ./
 RUN npm install --no-audit --no-fund
 COPY . .
+RUN npm run build
+
+FROM node:20-alpine
+WORKDIR /app
+ENV NODE_ENV=production
+COPY --from=builder /app/package.json ./
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/.next ./.next
+COPY --from=builder /app/public ./public
 EXPOSE 3000
-CMD ["npm", "run", "dev"]
+CMD ["npm", "run", "start"]
 """.strip()
         self.assembler.add_file(f"{fe_root}/Dockerfile", fe_docker)
 
