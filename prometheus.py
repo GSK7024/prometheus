@@ -28,6 +28,7 @@ import random
 import psutil
 import yaml
 from cryptography.fernet import Fernet
+import hashlib
 
 try:
     import docker  # Optional
@@ -521,6 +522,14 @@ class Config:
         ]
         # Personas
         self.max_personas = 1000
+        # Deep-think planner
+        self.use_deep_planner = True
+        self.research_budgets = {
+            "max_queries": 8,
+            "max_results_per_query": 5,
+            "fetch_timeout_s": 20,
+            "concurrency": 5,
+        }
 
         # Language configs with enhanced TDD support
         self.language_configs["python"]["test_command"] = (
@@ -1057,6 +1066,49 @@ class Modality(Enum):
     SENSOR_DATA = "sensor_data"
 
 
+# --- Deep-Think Planning Data Structures ---
+@dataclass
+class Evidence:
+    url: str
+    title: str
+    snippet: str
+    hash: str
+    score: float = 0.0
+
+
+@dataclass
+class PlanTask:
+    id: str
+    description: str
+    rationale: str = ""
+    dependencies: List[str] = field(default_factory=list)
+    evidence: List[Evidence] = field(default_factory=list)
+    risks: List[str] = field(default_factory=list)
+    mitigations: List[str] = field(default_factory=list)
+    owner_persona: str = ""
+    estimate_hours: float = 0.0
+
+
+@dataclass
+class PlanNode:
+    id: str
+    title: str
+    objective: str
+    tasks: List[PlanTask] = field(default_factory=list)
+    children: List[str] = field(default_factory=list)
+    decisions: List[str] = field(default_factory=list)
+    risks: List[str] = field(default_factory=list)
+    mitigations: List[str] = field(default_factory=list)
+
+
+@dataclass
+class PlanGraph:
+    goal: str
+    nodes: Dict[str, PlanNode] = field(default_factory=dict)
+    root_id: str = "root"
+
+    def to_json(self) -> str:
+        return json.dumps(self, default=lambda o: o.__dict__, indent=2)
 class CognitiveState(Enum):
     FOCUSED = "focused"
     EXPLORATORY = "exploratory"
@@ -2646,6 +2698,49 @@ Please repair and return ONLY valid JSON that conforms to the schema. No explana
             dev_strategy=dev_strategy,
         )
 
+    # --- Web Researcher and Summarizer ---
+    async def web_research(
+        self,
+        queries: List[str],
+        evidence_store: EvidenceStore,
+        budgets: Dict[str, Any],
+    ) -> None:
+        """Parallel web research using provided web_search tool with budgets."""
+        max_queries = budgets.get("max_queries", 5)
+        max_per = budgets.get("max_results_per_query", 5)
+        used = 0
+        for q in queries[:max_queries]:
+            try:
+                res = await asyncio.to_thread(lambda: functions.web_search({"search_term": q, "explanation": "planner research"}))
+                # res is a tool-call result; tolerate structure
+                items = res.get("results", []) if isinstance(res, dict) else []
+                for it in items[:max_per]:
+                    url = it.get("url") or it.get("link") or ""
+                    title = it.get("title") or ""
+                    snippet = it.get("snippet") or it.get("description") or ""
+                    if url and snippet:
+                        score = 0.5 + 0.5 * (len(snippet) / 400.0)
+                        evidence_store.put(url, title, snippet, score)
+                used += 1
+            except Exception:
+                continue
+
+    async def research_summary(
+        self,
+        goal: str,
+        evidence: List[Evidence],
+        dev_strategy: str = None,
+    ) -> str:
+        corpus = "\n\n".join([
+            f"Title: {e.title}\nURL: {e.url}\nSnippet: {e.snippet}"
+            for e in sorted(evidence, key=lambda x: -x.score)[:10]
+        ])
+        prompt = (
+            f"Synthesize a rigorous research brief for goal: {goal}.\n"
+            f"Use the following evidence with citations [#]. Provide key findings, constraints, options, and recommendations.\n\n{corpus}"
+        )
+        return await self._make_api_call(prompt, "Research Summarizer", is_json=False, dev_strategy=dev_strategy)
+
     async def code_validator(
         self,
         code: str,
@@ -3485,6 +3580,26 @@ class ToolRegistry:
             if pattern in patterns and patterns[pattern] > 0
         ]
 
+
+# --- Evidence Store ---
+class EvidenceStore:
+    def __init__(self):
+        self.cache: Dict[str, Evidence] = {}
+
+    def _hash(self, url: str, snippet: str) -> str:
+        h = hashlib.sha256()
+        h.update((url + "\n" + snippet).encode("utf-8"))
+        return h.hexdigest()
+
+    def put(self, url: str, title: str, snippet: str, score: float) -> Evidence:
+        key = self._hash(url, snippet)
+        ev = Evidence(url=url, title=title, snippet=snippet, hash=key, score=score)
+        self.cache[key] = ev
+        return ev
+
+    def get_all(self) -> List[Evidence]:
+        return list(self.cache.values())
+
     def get_tools_by_strategy(self, strategy: str) -> List[str]:
         """Get tools relevant to strategy."""
         if strategy == DevelopmentStrategy.TDD.value:
@@ -3619,6 +3734,10 @@ class UltraCognitiveForgeOrchestrator:
         self.assembler = CognitiveFileAssembler(self.sandbox_dir, agent_filename)
         self.shell = CognitiveShellCommander(self.sandbox_dir)
         self.constitution = self._load_constitution()
+
+        # Deep-think planner components
+        self.plan_graph: Optional[PlanGraph] = None
+        self.evidence_store = EvidenceStore()
 
         # Initialize enhanced tools
         cloud_tool = CloudDeploymentTool(self.sandbox_dir)
@@ -3781,6 +3900,26 @@ class UltraCognitiveForgeOrchestrator:
         """Initializes the project by planning the architecture and first steps."""
         logger.info("Initializing project...")
         try:
+            # Optional deep planner preamble
+            if getattr(config, "use_deep_planner", False):
+                logger.info("Deep Planner: Running web research preamble...")
+                queries = [
+                    f"{self.goal} best practices",
+                    f"{self.goal} pitfalls",
+                    f"{self.goal} algorithms",
+                    f"{self.goal} implementation guide",
+                ]
+                await self.ai.web_research(queries, self.evidence_store, config.research_budgets)
+                summary = await self.ai.research_summary(self.goal, self.evidence_store.get_all(), self.project_state.development_strategy)
+                # Seed plan graph root
+                self.plan_graph = PlanGraph(goal=self.goal)
+                self.plan_graph.nodes[self.plan_graph.root_id] = PlanNode(
+                    id=self.plan_graph.root_id,
+                    title="Root Plan",
+                    objective=self.goal,
+                    decisions=["Seeded by deep planner"],
+                )
+                logger.info("Deep Planner: Research summary synthesized.")
             # Phase 1: Master Planner
             plan = await self.ai.master_planner(
                 self.goal,
