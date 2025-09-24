@@ -1355,6 +1355,8 @@ class ProjectState:
     ci_status: str = "pending"  # New
     # Cognitive
     metacognition_log: List[Dict] = field(default_factory=list)  # New
+    # File activity tracking to avoid churn
+    file_activity_counts: Dict[str, int] = field(default_factory=dict)
 
     def __post_init__(self):
         if not self.living_blueprint:
@@ -4390,12 +4392,8 @@ class UltraCognitiveForgeOrchestrator:
         # Agile: pull next user story from sprint backlog and convert into a concrete dev task
         if self.project_state.development_strategy == DevelopmentStrategy.AGILE.value:
             # Prevent infinite churn on the same file: count last N tasks by target_file
-            recent = self.project_state.completed_tasks[-10:]
-            same_file_count = 0
-            for t in recent:
-                if isinstance(t, str) and "main.py" in t:
-                    same_file_count += 1
-            if same_file_count >= getattr(config, "max_same_file_tasks", 2):
+            main_edits = self.project_state.file_activity_counts.get("main.py", 0)
+            if main_edits >= getattr(config, "max_same_file_tasks", 2):
                 # Force a different file if available in blueprint
                 alt = None
                 for f in self.project_state.living_blueprint.root:
@@ -4950,6 +4948,9 @@ class UltraCognitiveForgeOrchestrator:
                     logger.info(f"Code for {target_file} passed validation.")
                     self.assembler.add_file(target_file, generated_code)
                     self.assembler.write_files_to_disk()
+                    # Update file activity counter
+                    cnt = self.project_state.file_activity_counts.get(target_file, 0)
+                    self.project_state.file_activity_counts[target_file] = cnt + 1
                     return (
                         True,
                         f"Successfully generated and validated code for {target_file}.",
