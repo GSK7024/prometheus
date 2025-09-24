@@ -5108,8 +5108,31 @@ class SourceCodeAnalyzer:
     def analyze_source(self):
         """Analyze the source code structure"""
         try:
-            with open(self.source_file, 'r', encoding='utf-8') as f:
-                source_code = f.read()
+            # Try multiple encodings to handle cross-platform compatibility
+            source_code = None
+            encodings_to_try = ['utf-8', 'utf-8-sig', 'latin-1', 'cp1252']
+
+            for encoding in encodings_to_try:
+                try:
+                    with open(self.source_file, 'r', encoding=encoding) as f:
+                        source_code = f.read()
+                    # If we get here, the encoding worked
+                    logger.debug(f"Successfully read source file with encoding: {encoding}")
+                    break
+                except (UnicodeDecodeError, UnicodeError):
+                    continue
+
+            if source_code is None:
+                # Fallback: try to read with error handling
+                try:
+                    with open(self.source_file, 'rb') as f:
+                        raw_data = f.read()
+                    # Try to decode as UTF-8, replacing invalid characters
+                    source_code = raw_data.decode('utf-8', errors='replace')
+                    logger.warning("Source file contained invalid UTF-8 characters, replaced with placeholders")
+                except Exception as fallback_error:
+                    logger.error(f"All encoding attempts failed for source file: {fallback_error}")
+                    return None
 
             # Parse AST
             self.ast_tree = ast.parse(source_code)
@@ -5213,32 +5236,48 @@ class SourceCodeAnalyzer:
                 })
 
         # Check for missing error handling
-        source_lines = open(self.source_file).readlines()
-        for i, func in enumerate(self.functions):
-            func_lines = source_lines[func['lineno']-1:func['lineno']+50]
-            func_text = ''.join(func_lines)
+        try:
+            source_lines = []
+            encodings_to_try = ['utf-8', 'utf-8-sig', 'latin-1', 'cp1252']
 
-            if 'try:' not in func_text and 'except' not in func_text:
-                if func['complexity'] > 5:  # Only suggest for moderately complex functions
-                    suggestions.append({
-                        'type': 'enhance',
-                        'target': f"function_{func['name']}",
-                        'suggestion': f"Add error handling to {func['name']}",
-                        'priority': 'medium'
-                    })
+            for encoding in encodings_to_try:
+                try:
+                    with open(self.source_file, 'r', encoding=encoding) as f:
+                        source_lines = f.readlines()
+                    break
+                except (UnicodeDecodeError, UnicodeError):
+                    continue
 
-        # Check for missing documentation
-        for func in self.functions:
-            func_lines = source_lines[func['lineno']-1:func['lineno']+10]
-            func_text = ''.join(func_lines)
+            if not source_lines:
+                logger.warning("Could not read source lines for analysis")
+            else:
+                for i, func in enumerate(self.functions):
+                    func_lines = source_lines[func['lineno']-1:func['lineno']+50]
+                    func_text = ''.join(func_lines)
 
-            if '"""' not in func_text and "'''" not in func_text:
-                suggestions.append({
-                    'type': 'document',
-                    'target': f"function_{func['name']}",
-                    'suggestion': f"Add docstring to {func['name']}",
-                    'priority': 'low'
-                })
+                    if 'try:' not in func_text and 'except' not in func_text:
+                        if func['complexity'] > 5:  # Only suggest for moderately complex functions
+                            suggestions.append({
+                                'type': 'enhance',
+                                'target': f"function_{func['name']}",
+                                'suggestion': f"Add error handling to {func['name']}",
+                                'priority': 'medium'
+                            })
+
+                # Check for missing documentation
+                for func in self.functions:
+                    func_lines = source_lines[func['lineno']-1:func['lineno']+10]
+                    func_text = ''.join(func_lines)
+
+                    if '"""' not in func_text and "'''" not in func_text:
+                        suggestions.append({
+                            'type': 'document',
+                            'target': f"function_{func['name']}",
+                            'suggestion': f"Add docstring to {func['name']}",
+                            'priority': 'low'
+                        })
+        except Exception as e:
+            logger.warning(f"Error during source code line analysis: {e}")
 
         return suggestions
 
@@ -5321,12 +5360,38 @@ class SelfEvolutionManager:
         backup_filename = f"prometheus_backup_v{self.current_version.replace('.', '_')}.py"
         backup_path = os.path.join(script_dir, backup_filename)
         source_path = os.path.join(script_dir, os.path.basename(__file__))
+
         try:
-            shutil.copy2(source_path, backup_path)
+            # Use copy2 to preserve metadata, but handle encoding issues
+            if os.path.exists(source_path):
+                shutil.copy2(source_path, backup_path)
+                logger.info(f"✅ Created backup: {backup_path}")
+            else:
+                logger.warning(f"Source file not found for backup: {source_path}")
         except Exception as e:
             logger.warning(f"Failed to create backup: {e}")
-            # Continue without backup if it fails
-        logger.info(f"✅ Created backup: {backup_path}")
+            # Try alternative backup method
+            try:
+                # Fallback: read with multiple encodings and write
+                content = ""
+                encodings_to_try = ['utf-8', 'utf-8-sig', 'latin-1', 'cp1252']
+
+                for encoding in encodings_to_try:
+                    try:
+                        with open(source_path, 'r', encoding=encoding) as f:
+                            content = f.read()
+                        break
+                    except (UnicodeDecodeError, UnicodeError):
+                        continue
+
+                if content:
+                    with open(backup_path, 'w', encoding='utf-8') as f:
+                        f.write(content)
+                    logger.info(f"✅ Created backup using fallback method: {backup_path}")
+                else:
+                    logger.error("Could not read source file for backup creation")
+            except Exception as fallback_error:
+                logger.error(f"Fallback backup creation also failed: {fallback_error}")
 
         # Execute improvements
         results = {
@@ -5376,8 +5441,21 @@ class SelfEvolutionManager:
         # For now, create a comment in the source code indicating the need for refactoring
         # In a full implementation, this would use AST manipulation to actually refactor the code
         try:
-            with open(self.source_analyzer.source_file, 'r') as f:
-                lines = f.readlines()
+            # Try multiple encodings to handle cross-platform compatibility
+            lines = []
+            encodings_to_try = ['utf-8', 'utf-8-sig', 'latin-1', 'cp1252']
+
+            for encoding in encodings_to_try:
+                try:
+                    with open(self.source_analyzer.source_file, 'r', encoding=encoding) as f:
+                        lines = f.readlines()
+                    break
+                except (UnicodeDecodeError, UnicodeError):
+                    continue
+
+            if not lines:
+                logger.error("Could not read source file for refactoring")
+                return
 
             # Find the function and add a comment
             func_name = improvement['target'].replace('function_', '')
@@ -5387,10 +5465,14 @@ class SelfEvolutionManager:
                     lines.insert(i, f"# TODO: REFACTOR - {improvement['suggestion']}\n")
                     break
 
-            with open(self.source_analyzer.source_file, 'w') as f:
-                f.writelines(lines)
+            # Write back with UTF-8 encoding
+            try:
+                with open(self.source_analyzer.source_file, 'w', encoding='utf-8') as f:
+                    f.writelines(lines)
+                logger.info(f"✅ Added refactoring note for {func_name}")
+            except Exception as write_error:
+                logger.error(f"Failed to write refactoring changes: {write_error}")
 
-            logger.info(f"✅ Added refactoring note for {func_name}")
         except Exception as e:
             logger.error(f"Failed to add refactoring note: {e}")
 
@@ -5399,8 +5481,21 @@ class SelfEvolutionManager:
         logger.info(f"🛡️ Enhancing error handling for {improvement['target']}")
 
         try:
-            with open(self.source_analyzer.source_file, 'r') as f:
-                lines = f.readlines()
+            # Try multiple encodings to handle cross-platform compatibility
+            lines = []
+            encodings_to_try = ['utf-8', 'utf-8-sig', 'latin-1', 'cp1252']
+
+            for encoding in encodings_to_try:
+                try:
+                    with open(self.source_analyzer.source_file, 'r', encoding=encoding) as f:
+                        lines = f.readlines()
+                    break
+                except (UnicodeDecodeError, UnicodeError):
+                    continue
+
+            if not lines:
+                logger.error("Could not read source file for error handling enhancement")
+                return
 
             func_name = improvement['target'].replace('function_', '')
             for i, line in enumerate(lines):
@@ -5409,10 +5504,14 @@ class SelfEvolutionManager:
                     lines.insert(i, f"# TODO: ERROR_HANDLING - Add try-catch blocks and error handling\n")
                     break
 
-            with open(self.source_analyzer.source_file, 'w') as f:
-                f.writelines(lines)
+            # Write back with UTF-8 encoding
+            try:
+                with open(self.source_analyzer.source_file, 'w', encoding='utf-8') as f:
+                    f.writelines(lines)
+                logger.info(f"✅ Added error handling note for {func_name}")
+            except Exception as write_error:
+                logger.error(f"Failed to write error handling changes: {write_error}")
 
-            logger.info(f"✅ Added error handling note for {func_name}")
         except Exception as e:
             logger.error(f"Failed to add error handling note: {e}")
 
@@ -5421,8 +5520,21 @@ class SelfEvolutionManager:
         logger.info(f"📝 Adding documentation for {improvement['target']}")
 
         try:
-            with open(self.source_analyzer.source_file, 'r') as f:
-                lines = f.readlines()
+            # Try multiple encodings to handle cross-platform compatibility
+            lines = []
+            encodings_to_try = ['utf-8', 'utf-8-sig', 'latin-1', 'cp1252']
+
+            for encoding in encodings_to_try:
+                try:
+                    with open(self.source_analyzer.source_file, 'r', encoding=encoding) as f:
+                        lines = f.readlines()
+                    break
+                except (UnicodeDecodeError, UnicodeError):
+                    continue
+
+            if not lines:
+                logger.error("Could not read source file for documentation enhancement")
+                return
 
             func_name = improvement['target'].replace('function_', '')
             for i, line in enumerate(lines):
@@ -5431,10 +5543,14 @@ class SelfEvolutionManager:
                     lines.insert(i, f"# TODO: DOCUMENT - Add docstring explaining function purpose, parameters, and return value\n")
                     break
 
-            with open(self.source_analyzer.source_file, 'w') as f:
-                f.writelines(lines)
+            # Write back with UTF-8 encoding
+            try:
+                with open(self.source_analyzer.source_file, 'w', encoding='utf-8') as f:
+                    f.writelines(lines)
+                logger.info(f"✅ Added documentation note for {func_name}")
+            except Exception as write_error:
+                logger.error(f"Failed to write documentation changes: {write_error}")
 
-            logger.info(f"✅ Added documentation note for {func_name}")
         except Exception as e:
             logger.error(f"Failed to add documentation note: {e}")
 
@@ -5443,8 +5559,21 @@ class SelfEvolutionManager:
         logger.info(f"⚡ Implementing performance optimization: {improvement['description']}")
 
         try:
-            with open(self.source_analyzer.source_file, 'r') as f:
-                content = f.read()
+            # Try multiple encodings to handle cross-platform compatibility
+            content = ""
+            encodings_to_try = ['utf-8', 'utf-8-sig', 'latin-1', 'cp1252']
+
+            for encoding in encodings_to_try:
+                try:
+                    with open(self.source_analyzer.source_file, 'r', encoding=encoding) as f:
+                        content = f.read()
+                    break
+                except (UnicodeDecodeError, UnicodeError):
+                    continue
+
+            if not content:
+                logger.error("Could not read source file for performance optimization")
+                return
 
             # Add caching imports if not present
             if 'from functools import lru_cache' not in content and 'lru_cache' not in content:
@@ -5464,10 +5593,14 @@ class SelfEvolutionManager:
             optimization_note = f"# TODO: PERFORMANCE - {improvement['implementation']}\n"
             content = optimization_note + content
 
-            with open(self.source_analyzer.source_file, 'w') as f:
-                f.write(content)
+            # Write back with UTF-8 encoding
+            try:
+                with open(self.source_analyzer.source_file, 'w', encoding='utf-8') as f:
+                    f.write(content)
+                logger.info("✅ Added performance optimization framework")
+            except Exception as write_error:
+                logger.error(f"Failed to write performance optimization changes: {write_error}")
 
-            logger.info("✅ Added performance optimization framework")
         except Exception as e:
             logger.error(f"Failed to implement performance optimization: {e}")
 
@@ -5500,17 +5633,34 @@ def with_retry(func, max_attempts=3, delay=1):
             time.sleep(delay)
 """
 
-            with open(self.source_analyzer.source_file, 'r') as f:
-                content = f.read()
+            # Try multiple encodings to handle cross-platform compatibility
+            content = ""
+            encodings_to_try = ['utf-8', 'utf-8-sig', 'latin-1', 'cp1252']
+
+            for encoding in encodings_to_try:
+                try:
+                    with open(self.source_analyzer.source_file, 'r', encoding=encoding) as f:
+                        content = f.read()
+                    break
+                except (UnicodeDecodeError, UnicodeError):
+                    continue
+
+            if not content:
+                logger.error("Could not read source file for failure pattern resolution")
+                return
 
             # Add defensive patterns at the end of the file
             if defensive_patterns not in content:
                 content += "\n" + defensive_patterns
 
-            with open(self.source_analyzer.source_file, 'w') as f:
-                f.write(content)
+            # Write back with UTF-8 encoding
+            try:
+                with open(self.source_analyzer.source_file, 'w', encoding='utf-8') as f:
+                    f.write(content)
+                logger.info("✅ Added defensive programming patterns")
+            except Exception as write_error:
+                logger.error(f"Failed to write failure pattern resolution changes: {write_error}")
 
-            logger.info("✅ Added defensive programming patterns")
         except Exception as e:
             logger.error(f"Failed to resolve failure patterns: {e}")
 
