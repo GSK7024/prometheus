@@ -537,6 +537,7 @@ class Config:
         self.reviewer_min_lines = 80
         self.skip_reviewer_for_small_changes = True
         self.max_same_file_tasks = 2
+        self.reviewer_max_per_file_consecutive = 1
 
         # Language configs with enhanced TDD support
         self.language_configs["python"]["test_command"] = (
@@ -4426,6 +4427,21 @@ class UltraCognitiveForgeOrchestrator:
                     idx = self.project_state.file_rotation_idx % len(candidate_files)
                     target_file = candidate_files[idx]
                     self.project_state.file_rotation_idx += 1
+                    # Prioritize tasks that create missing files (breadth-first)
+                    if target_file not in self.assembler.get_all_files():
+                        self.project_state.task_queue.insert(
+                            0,
+                            {
+                                "task_type": TaskType.TDD_IMPLEMENTATION.value,
+                                "task_description": f"Create and implement: {story.get('description', 'Story')} in {target_file}",
+                                "details": {
+                                    "target_file": target_file,
+                                    "acceptance_criteria": story.get("acceptance_criteria", []),
+                                    "story_points": story.get("story_points", 1),
+                                },
+                            },
+                        )
+                        continue
                     self.project_state.task_queue.append(
                         {
                             "task_type": TaskType.TDD_IMPLEMENTATION.value,
@@ -4915,10 +4931,13 @@ class UltraCognitiveForgeOrchestrator:
                                 return False, f"Diff guard blocked change for security pattern: {patt}"
                     # Reviewer/Judge loop to further refine (cost-aware)
                     lines = generated_code.count("\n") + 1
+                    # Cost-aware reviewer policy with per-file consecutive cap
+                    prev_cnt = self.project_state.file_activity_counts.get(target_file, 0)
                     should_review = (
                         getattr(config, "reviewer_enabled", True)
                         and (len(self.project_state.completed_tasks) % max(1, getattr(config, "reviewer_every_n_tasks", 3)) == 0)
                         and (not getattr(config, "skip_reviewer_for_small_changes", True) or lines >= getattr(config, "reviewer_min_lines", 80))
+                        and prev_cnt <= getattr(config, "reviewer_max_per_file_consecutive", 1)
                     )
                     if should_review:
                         try:
