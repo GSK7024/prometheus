@@ -1,0 +1,24 @@
+{
+  "learnings": [
+    {
+      "id": "test_1",
+      "operation": "test_task",
+      "context": {
+        "test": true
+      },
+      "outcome": "success",
+      "timestamp": 1758706497.926987
+    }
+  ],
+  "failures": [
+    {
+      "id": "failure_1",
+      "operation": "test_api",
+      "context": {
+        "endpoint": "/test"
+      },
+      "error": "timeout",
+      "timestamp": 1758706497.92699
+    }
+  ]
+}
