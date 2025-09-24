@@ -1,0 +1,17 @@
+numpy
+torch
+transformers
+scikit-learn
+chromadb
+httpx
+python-dotenv
+psutil
+PyYAML
+cryptography
+tenacity
+faiss-cpu
+docker
+kubernetes
+coverage
+pytest
+gitpython
