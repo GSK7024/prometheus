@@ -4789,7 +4789,15 @@ Backend: http://localhost:8000/health
             last_task_result = None
             sprint_count = 0  # For Agile
 
+            # Maximum task execution limit to prevent infinite loops
+            max_tasks = getattr(config, "max_tasks_per_run", 100)
+
             while not goal_achieved:
+                # Prevent infinite loops - emergency brake
+                if len(self.project_state.completed_tasks) >= max_tasks:
+                    logger.warning(f"Maximum task limit ({max_tasks}) reached. Stopping to prevent infinite loop.")
+                    break
+
                 # Cognitive health check
                 if not self._check_cognitive_health():
                     logger.warning(
@@ -4837,6 +4845,17 @@ Backend: http://localhost:8000/health
                     logger.info(
                         f"Task completed successfully. Total completed: {len(self.project_state.completed_tasks)}"
                     )
+
+                    # For agile strategy, remove completed stories from sprint backlog
+                    if self.project_state.development_strategy == DevelopmentStrategy.AGILE.value:
+                        task_desc = task_response.get("task_description", "")
+                        # Remove the corresponding story from sprint backlog
+                        for i, story in enumerate(self.project_state.sprint_backlog):
+                            if story.get("description", "") in task_desc:
+                                self.project_state.sprint_backlog.pop(i)
+                                logger.info(f"Removed completed story from sprint backlog: {story.get('description', '')}")
+                                break
+
                     self._update_cognitive_state(success=True)
                 else:
                     logger.warning("Task failed. Will attempt to recover.")
@@ -5208,6 +5227,14 @@ Backend: http://localhost:8000/health
                         "task_description": f"Diversify focus: implement story part in {alt}",
                         "details": {"target_file": alt, "acceptance_criteria": []},
                     }
+                else:
+                    # No alternative files available, continue with current file
+                    logger.info("No alternative files available for diversification, continuing with current approach")
+                    # Reset the main.py edit count to prevent getting stuck
+                    if "main.py" in self.project_state.file_activity_counts:
+                        self.project_state.file_activity_counts["main.py"] = 0
+                        logger.info("Reset main.py edit count to prevent infinite loop")
+
             # If no queued tasks and sprint backlog exists, pre-enqueue a batch of tasks
             if self.project_state.sprint_backlog and not self.project_state.task_queue:
                 batch_size = config.strategy_configs[DevelopmentStrategy.AGILE.value].get(
