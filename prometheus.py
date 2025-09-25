@@ -1070,6 +1070,7 @@ class TaskType(Enum):
     BLUEPRINT_FILE = "BLUEPRINT_FILE"
     TDD_IMPLEMENTATION = "TDD_IMPLEMENTATION"
     CODE_MODIFICATION = "CODE_MODIFICATION"
+    REFACTOR = "REFACTOR"  # New: Code quality improvement and refactoring
     TOOL_EXECUTION = "TOOL_EXECUTION"
     ENVIRONMENT_CHECK = "ENVIRONMENT_CHECK"
     FILE_SYSTEM_REFACTORING = "FILE_SYSTEM_REFACTORING"
@@ -2669,13 +2670,51 @@ Please repair and return ONLY valid JSON that conforms to the schema. No explana
         target_file = task.get("details", {}).get("target_file")
         file_blueprint = living_blueprint.get_file(target_file)
 
+        # Retrieve relevant code patterns for memory-augmented generation
+        relevant_patterns = await self.retrieve_relevant_patterns({
+            "dev_strategy": dev_strategy,
+            "task_type": task.get("task_type"),
+            "file_type": file_blueprint.language
+        })
+
+        # Format patterns for inclusion in prompt
+        patterns_text = ""
+        if relevant_patterns:
+            patterns_text = "\nRELEVANT CODE PATTERNS TO FOLLOW:\n"
+            for i, pattern in enumerate(relevant_patterns, 1):
+                patterns_text += f"""
+Pattern {i}: {pattern.get('pattern_name', 'Unknown')} ({pattern.get('category', 'general')})
+Description: {pattern.get('description', 'No description')}
+Code Example:
+```python
+{pattern.get('code_snippet', 'No code snippet')}
+```
+Applicable in: {', '.join(pattern.get('applicable_contexts', []))}
+Quality Score: {pattern.get('quality_score', 0.0)}
+---
+"""
+            patterns_text += "\nUse these patterns as reference for best practices in your implementation.\n"
+
         prompt = (
-            f"You are an expert programmer. Your task is to write the complete code for the file '{target_file}'.\n"
+            f"You are a senior software engineer and expert programmer. Your task is to write the complete code for the file '{target_file}'.\n"
             f"PROJECT GOAL: {goal}\n"
             f"DEVELOPMENT STRATEGY: {dev_strategy}\n"
             f"CURRENT CODEBASE CONTEXT: {list(current_codebase.keys())}\n"
-            f"FILE BLUEPRINT:\n{json.dumps(file_blueprint, default=lambda o: o.__dict__, indent=2)}\n\n"
-            "Adhere strictly to the blueprint. Implement all classes and methods as described. Ensure the code is robust, well-documented, and production-ready.\n"
+            f"FILE BLUEPRINT:\n{json.dumps(file_blueprint, default=lambda o: o.__dict__, indent=2)}\n"
+            f"{patterns_text}\n"
+            "REQUIREMENTS:\n"
+            "• Write comprehensive, Google-style docstrings for ALL public modules, classes, and functions\n"
+            "• Include detailed Args, Returns, Raises, and Examples sections in docstrings\n"
+            "• Use modern, idiomatic Python patterns (type hints, dataclasses, async/await where appropriate)\n"
+            "• Follow PEP 8 style guidelines strictly\n"
+            "• Use pytest for testing, dependency injection in FastAPI, and modern async patterns\n"
+            "• Ensure code is robust, well-documented, and production-ready\n"
+            "• Keep cyclomatic complexity under 10 per function - refactor into smaller functions if needed\n"
+            "• Use descriptive variable names and add inline comments for complex logic\n"
+            "• Implement proper error handling with custom exceptions and logging\n"
+            "• Add validation using Pydantic models where appropriate\n"
+            "• Reference the provided code patterns as examples of best practices\n\n"
+            "Adhere strictly to the blueprint while following all these coding standards and learning from the provided patterns.\n"
         )
         if feedback:
             prompt += f"PREVIOUS ATTEMPT FAILED. FEEDBACK: {feedback}\nPlease correct the code based on this feedback.\n"
@@ -2688,8 +2727,748 @@ Please repair and return ONLY valid JSON that conforms to the schema. No explana
             cognitive_state=cognitive_state,
             dev_strategy=dev_strategy,
         )
-        # The code cleaning might be less necessary if the prompt is very strict, but it's a good safeguard.
-        return self._clean_code(raw_code, language=file_blueprint.language)
+
+        # Check code complexity using radon (if available)
+        cleaned_code = self._clean_code(raw_code, language=file_blueprint.language)
+
+        # Check cyclomatic complexity
+        if self._check_code_complexity(cleaned_code) > 10:
+            logger.warning(f"Generated code has high complexity (>10). Requesting refactoring...")
+            # Add complexity feedback and retry once
+            complexity_feedback = "The generated code has cyclomatic complexity >10. Please refactor into smaller, more manageable functions while maintaining the same functionality."
+            prompt += f"\n\nCOMPLEXITY FEEDBACK: {complexity_feedback}\n"
+
+            raw_code = await self._make_api_call(
+                prompt,
+                "Code Crafter",
+                cognitive_state=cognitive_state,
+                dev_strategy=dev_strategy,
+            )
+            cleaned_code = self._clean_code(raw_code, language=file_blueprint.language)
+
+            # Final complexity check
+            final_complexity = self._check_code_complexity(cleaned_code)
+            if final_complexity > 10:
+                logger.warning(f"Code still has high complexity ({final_complexity}) after refactoring attempt.")
+
+        return cleaned_code
+
+    async def extract_and_store_code_patterns(
+        self,
+        code: str,
+        file_name: str,
+        goal: str,
+        dev_strategy: str,
+        cognitive_state: Dict = None
+    ) -> None:
+        """Extract architectural and coding patterns from high-quality code and store in memory."""
+        try:
+            # Only extract patterns from successful, high-quality code
+            if not code or len(code.strip()) < 100:
+                return
+
+            # Analyze code structure and patterns
+            patterns = await self._analyze_code_patterns(code, file_name, goal, dev_strategy)
+
+            # Store patterns in neuromorphic memory
+            if patterns:
+                for pattern in patterns:
+                    await self._store_pattern_in_memory(pattern, cognitive_state)
+
+                logger.info(f"Extracted and stored {len(patterns)} code patterns from {file_name}")
+
+        except Exception as e:
+            logger.warning(f"Failed to extract code patterns: {e}")
+
+    async def _analyze_code_patterns(self, code: str, file_name: str, goal: str, dev_strategy: str) -> List[Dict]:
+        """Analyze code and extract architectural/coding patterns."""
+        patterns = []
+
+        # Pattern 1: FastAPI Structure (if applicable)
+        if "fastapi" in code.lower() and "APIRouter" in code:
+            patterns.append({
+                "type": "architectural",
+                "category": "fastapi",
+                "name": "Modern FastAPI Router Structure",
+                "description": "Clean FastAPI router with proper dependency injection and error handling",
+                "code_snippet": self._extract_fastapi_pattern(code),
+                "applicable_contexts": ["web_api", "rest_api", "microservice"],
+                "quality_score": 0.95
+            })
+
+        # Pattern 2: Pydantic Models
+        if "BaseModel" in code and "Field" in code:
+            patterns.append({
+                "type": "data_modeling",
+                "category": "pydantic",
+                "name": "Comprehensive Pydantic Models",
+                "description": "Well-structured Pydantic models with validation and documentation",
+                "code_snippet": self._extract_pydantic_pattern(code),
+                "applicable_contexts": ["data_validation", "api_schemas", "configuration"],
+                "quality_score": 0.90
+            })
+
+        # Pattern 3: SQLAlchemy ORM Usage
+        if "Column" in code and "relationship" in code.lower():
+            patterns.append({
+                "type": "data_access",
+                "category": "sqlalchemy",
+                "name": "Modern SQLAlchemy ORM Patterns",
+                "description": "Proper SQLAlchemy model definitions with relationships and constraints",
+                "code_snippet": self._extract_sqlalchemy_pattern(code),
+                "applicable_contexts": ["database_models", "orm", "data_persistence"],
+                "quality_score": 0.88
+            })
+
+        # Pattern 4: Service Layer Architecture
+        if "Service" in code and "async def" in code:
+            patterns.append({
+                "type": "architectural",
+                "category": "service_layer",
+                "name": "Clean Architecture Service Layer",
+                "description": "Proper separation of concerns with service layer for business logic",
+                "code_snippet": self._extract_service_pattern(code),
+                "applicable_contexts": ["business_logic", "clean_architecture", "dependency_injection"],
+                "quality_score": 0.92
+            })
+
+        # Pattern 5: Comprehensive Testing
+        if "pytest" in code or "@pytest" in code:
+            patterns.append({
+                "type": "testing",
+                "category": "pytest",
+                "name": "Modern Pytest Patterns",
+                "description": "Comprehensive test suite with fixtures, mocking, and async support",
+                "code_snippet": self._extract_pytest_pattern(code),
+                "applicable_contexts": ["unit_testing", "integration_testing", "test_automation"],
+                "quality_score": 0.87
+            })
+
+        return patterns
+
+    def _extract_fastapi_pattern(self, code: str) -> str:
+        """Extract FastAPI pattern from code."""
+        lines = code.split('\n')
+        pattern_lines = []
+
+        for i, line in enumerate(lines):
+            if 'from fastapi import' in line or 'APIRouter' in line or '@router.' in line:
+                pattern_lines.extend(lines[max(0, i-2):min(len(lines), i+5)])
+                break
+
+        return '\n'.join(pattern_lines[:20])  # Limit to 20 lines
+
+    def _extract_pydantic_pattern(self, code: str) -> str:
+        """Extract Pydantic pattern from code."""
+        lines = code.split('\n')
+        pattern_lines = []
+
+        for i, line in enumerate(lines):
+            if 'from pydantic import' in line or 'class.*BaseModel' in line:
+                pattern_lines.extend(lines[max(0, i-1):min(len(lines), i+15)])
+                break
+
+        return '\n'.join(pattern_lines[:25])
+
+    def _extract_sqlalchemy_pattern(self, code: str) -> str:
+        """Extract SQLAlchemy pattern from code."""
+        lines = code.split('\n')
+        pattern_lines = []
+
+        for i, line in enumerate(lines):
+            if 'from sqlalchemy' in line or 'class.*Base' in line or 'Column(' in line:
+                pattern_lines.extend(lines[max(0, i-1):min(len(lines), i+10)])
+                break
+
+        return '\n'.join(pattern_lines[:20])
+
+    def _extract_service_pattern(self, code: str) -> str:
+        """Extract service layer pattern from code."""
+        lines = code.split('\n')
+        pattern_lines = []
+
+        for i, line in enumerate(lines):
+            if 'class.*Service' in line or 'async def' in line and 'service' in line.lower():
+                pattern_lines.extend(lines[max(0, i-2):min(len(lines), i+8)])
+                break
+
+        return '\n'.join(pattern_lines[:15])
+
+    def _extract_pytest_pattern(self, code: str) -> str:
+        """Extract pytest pattern from code."""
+        lines = code.split('\n')
+        pattern_lines = []
+
+        for i, line in enumerate(lines):
+            if 'import pytest' in line or 'def test_' in line or '@pytest' in line:
+                pattern_lines.extend(lines[max(0, i-1):min(len(lines), i+10)])
+                break
+
+        return '\n'.join(pattern_lines[:15])
+
+    async def _store_pattern_in_memory(self, pattern: Dict, cognitive_state: Dict = None) -> None:
+        """Store a code pattern in neuromorphic memory."""
+        try:
+            # Create memory entry
+            memory_data = {
+                "pattern_name": pattern["name"],
+                "pattern_type": pattern["type"],
+                "category": pattern["category"],
+                "description": pattern["description"],
+                "code_snippet": pattern["code_snippet"],
+                "applicable_contexts": pattern["applicable_contexts"],
+                "quality_score": pattern["quality_score"],
+                "timestamp": time.time(),
+                "source_file": "code_pattern_extraction"
+            }
+
+            # Store in neuromorphic memory
+            self.memory.add_memory(
+                memory_data,
+                metadata={
+                    "type": "code_pattern",
+                    "category": pattern["category"],
+                    "quality_score": pattern["quality_score"]
+                },
+                strategy=["code_pattern", "learning"],
+                cognitive_state=cognitive_state,
+                dev_strategy="cognitive"
+            )
+
+            logger.info(f"Stored code pattern: {pattern['name']} (category: {pattern['category']})")
+
+        except Exception as e:
+            logger.warning(f"Failed to store pattern in memory: {e}")
+
+    async def retrieve_relevant_patterns(self, context: Dict, k: int = 3) -> List[Dict]:
+        """Retrieve relevant code patterns based on context."""
+        try:
+            # Create query based on context
+            query_parts = []
+            if context.get("dev_strategy"):
+                query_parts.append(f"development strategy: {context['dev_strategy']}")
+            if context.get("task_type"):
+                query_parts.append(f"task type: {context['task_type']}")
+            if context.get("file_type"):
+                query_parts.append(f"file type: {context['file_type']}")
+
+            query = " ".join(query_parts) if query_parts else "high quality code patterns"
+
+            # Use neuromorphic memory to find similar patterns
+            similar_memories = self.memory.retrieve_similar(query, k=k)
+
+            # Filter for code patterns
+            code_patterns = []
+            for memory in similar_memories:
+                if isinstance(memory, dict) and memory.get("type") == "code_pattern":
+                    code_patterns.append(memory)
+
+            return code_patterns[:k]
+
+        except Exception as e:
+            logger.warning(f"Failed to retrieve patterns: {e}")
+            return []
+
+    async def analyze_codebase_quality(self, codebase: Dict[str, str]) -> Dict[str, Any]:
+        """Analyze the entire codebase using cognitive pattern metrics and identify refactoring opportunities."""
+        try:
+            logger.info("Starting comprehensive codebase quality analysis...")
+
+            quality_report = {
+                "overall_score": 0.0,
+                "total_files": len(codebase),
+                "analysis_date": time.time(),
+                "quality_issues": [],
+                "complexity_hotspots": [],
+                "refactoring_priorities": [],
+                "recommendations": []
+            }
+
+            total_complexity_score = 0.0
+            total_maintainability_score = 0.0
+            file_count = 0
+
+            for file_name, file_content in codebase.items():
+                if not file_content or len(file_content.strip()) < 50:
+                    continue
+
+                try:
+                    # Analyze individual file
+                    file_analysis = await self._analyze_file_quality(file_name, file_content)
+
+                    if file_analysis["complexity_score"] > 0:
+                        file_count += 1
+                        total_complexity_score += file_analysis["complexity_score"]
+                        total_maintainability_score += file_analysis["maintainability_score"]
+
+                        # Identify high complexity hotspots
+                        if file_analysis["complexity_score"] < 0.7:  # Low complexity score
+                            quality_report["complexity_hotspots"].append({
+                                "file": file_name,
+                                "complexity_score": file_analysis["complexity_score"],
+                                "maintainability_score": file_analysis["maintainability_score"],
+                                "issues": file_analysis["issues"]
+                            })
+
+                        # Collect quality issues
+                        if file_analysis["issues"]:
+                            quality_report["quality_issues"].extend(file_analysis["issues"])
+
+                except Exception as e:
+                    logger.warning(f"Failed to analyze file {file_name}: {e}")
+                    continue
+
+            # Calculate overall scores
+            if file_count > 0:
+                quality_report["overall_score"] = (total_complexity_score + total_maintainability_score) / (2 * file_count)
+
+                # Generate refactoring priorities based on analysis
+                quality_report["refactoring_priorities"] = self._prioritize_refactoring_opportunities(
+                    quality_report["complexity_hotspots"],
+                    quality_report["quality_issues"]
+                )
+
+                # Generate specific recommendations
+                quality_report["recommendations"] = self._generate_refactoring_recommendations(
+                    quality_report["refactoring_priorities"]
+                )
+
+            logger.info(f"Codebase quality analysis complete. Overall score: {quality_report['overall_score']:.2f}")
+            return quality_report
+
+        except Exception as e:
+            logger.error(f"Failed to analyze codebase quality: {e}")
+            return {
+                "overall_score": 0.0,
+                "total_files": 0,
+                "analysis_date": time.time(),
+                "quality_issues": [],
+                "complexity_hotspots": [],
+                "refactoring_priorities": [],
+                "recommendations": [f"Analysis failed: {str(e)}"]
+            }
+
+    async def _analyze_file_quality(self, file_name: str, file_content: str) -> Dict[str, Any]:
+        """Analyze quality metrics for a single file."""
+        try:
+            # Check cyclomatic complexity
+            complexity_score = self._calculate_complexity_score(file_content)
+
+            # Check maintainability indicators
+            maintainability_score = self._calculate_maintainability_score(file_content, file_name)
+
+            # Identify specific quality issues
+            issues = self._identify_quality_issues(file_content, file_name)
+
+            return {
+                "complexity_score": complexity_score,
+                "maintainability_score": maintainability_score,
+                "issues": issues
+            }
+
+        except Exception as e:
+            logger.warning(f"Failed to analyze file {file_name}: {e}")
+            return {
+                "complexity_score": 0.0,
+                "maintainability_score": 0.0,
+                "issues": [f"Analysis failed: {str(e)}"]
+            }
+
+    def _calculate_complexity_score(self, code: str) -> float:
+        """Calculate complexity score (0-1, higher is better)."""
+        try:
+            complexity = self._check_code_complexity(code)
+
+            # Convert complexity to score (lower complexity = higher score)
+            if complexity <= 5:
+                return 1.0  # Excellent
+            elif complexity <= 10:
+                return 0.8  # Good
+            elif complexity <= 15:
+                return 0.6  # Moderate
+            elif complexity <= 20:
+                return 0.4  # Concerning
+            else:
+                return 0.2  # High complexity - needs refactoring
+
+        except Exception:
+            return 0.5  # Default moderate score
+
+    def _calculate_maintainability_score(self, code: str, file_name: str) -> float:
+        """Calculate maintainability score based on various factors."""
+        try:
+            score = 1.0
+
+            # Check for comprehensive docstrings
+            if not self._has_comprehensive_docstrings(code):
+                score -= 0.2
+
+            # Check for proper error handling
+            if not self._has_proper_error_handling(code):
+                score -= 0.1
+
+            # Check for type hints
+            if file_name.endswith('.py') and not self._has_type_hints(code):
+                score -= 0.1
+
+            # Check for long functions
+            if self._has_long_functions(code):
+                score -= 0.15
+
+            # Check for proper logging
+            if not self._has_proper_logging(code):
+                score -= 0.05
+
+            return max(0.0, score)  # Ensure non-negative
+
+        except Exception:
+            return 0.5  # Default moderate score
+
+    def _identify_quality_issues(self, code: str, file_name: str) -> List[str]:
+        """Identify specific quality issues in the code."""
+        issues = []
+
+        try:
+            # Check for missing docstrings
+            if not self._has_comprehensive_docstrings(code):
+                issues.append("Missing comprehensive docstrings")
+
+            # Check for long functions
+            if self._has_long_functions(code):
+                issues.append("Functions exceed recommended length (>50 lines)")
+
+            # Check for complex functions
+            complexity = self._check_code_complexity(code)
+            if complexity > 15:
+                issues.append(f"High cyclomatic complexity: {complexity}")
+
+            # Check for missing error handling
+            if not self._has_proper_error_handling(code):
+                issues.append("Missing proper error handling")
+
+            # Check for missing type hints (Python only)
+            if file_name.endswith('.py') and not self._has_type_hints(code):
+                issues.append("Missing type hints")
+
+            # Check for missing logging
+            if not self._has_proper_logging(code):
+                issues.append("Missing proper logging")
+
+        except Exception as e:
+            issues.append(f"Quality analysis error: {str(e)}")
+
+        return issues
+
+    def _has_comprehensive_docstrings(self, code: str) -> bool:
+        """Check if code has comprehensive docstrings."""
+        try:
+            # Look for Google-style or NumPy-style docstrings
+            if '"""' in code and ('Args:' in code or 'Parameters' in code or 'Returns' in code):
+                return True
+            return False
+        except:
+            return False
+
+    def _has_proper_error_handling(self, code: str) -> bool:
+        """Check if code has proper error handling."""
+        try:
+            # Look for try/except blocks or error handling
+            if 'try:' in code and 'except' in code:
+                return True
+            if 'raise' in code and 'Exception' in code:
+                return True
+            return False
+        except:
+            return False
+
+    def _has_type_hints(self, code: str) -> bool:
+        """Check if Python code has type hints."""
+        try:
+            # Look for type annotations
+            if '->' in code or ': str' in code or ': int' in code or ': List' in code:
+                return True
+            return False
+        except:
+            return False
+
+    def _has_long_functions(self, code: str) -> bool:
+        """Check if code has functions longer than recommended."""
+        try:
+            lines = code.split('\n')
+            in_function = False
+            function_lines = 0
+
+            for line in lines:
+                if line.strip().startswith('def '):
+                    in_function = True
+                    function_lines = 0
+                elif in_function and line.strip() and not line.startswith(' ') and not line.startswith('\t'):
+                    in_function = False
+                elif in_function:
+                    function_lines += 1
+                    if function_lines > 50:  # 50 lines is the threshold
+                        return True
+
+            return False
+        except:
+            return False
+
+    def _has_proper_logging(self, code: str) -> bool:
+        """Check if code has proper logging."""
+        try:
+            # Look for logging statements
+            if 'logger.' in code or 'logging.' in code:
+                return True
+            return False
+        except:
+            return False
+
+    def _prioritize_refactoring_opportunities(self, hotspots: List[Dict], issues: List[str]) -> List[Dict]:
+        """Prioritize refactoring opportunities based on impact and urgency."""
+        priorities = []
+
+        # Priority 1: High complexity hotspots
+        for hotspot in hotspots:
+            priorities.append({
+                "priority": "HIGH",
+                "category": "complexity",
+                "file": hotspot["file"],
+                "reason": f"High complexity: {hotspot['complexity_score']:.2f}",
+                "impact": "Performance and maintainability",
+                "suggested_action": "Break down complex functions"
+            })
+
+        # Priority 2: Files with multiple quality issues
+        file_issues = {}
+        for issue in issues:
+            # Extract file name from issue if present
+            file_name = "unknown"
+            if " in " in issue or " for " in issue:
+                # This is a rough heuristic - in practice you'd parse the issue more carefully
+                pass
+            file_issues[file_name] = file_issues.get(file_name, 0) + 1
+
+        for file_name, issue_count in file_issues.items():
+            if issue_count >= 3:
+                priorities.append({
+                    "priority": "HIGH",
+                    "category": "quality",
+                    "file": file_name,
+                    "reason": f"Multiple quality issues: {issue_count}",
+                    "impact": "Code maintainability",
+                    "suggested_action": "Comprehensive quality improvements"
+                })
+
+        return sorted(priorities, key=lambda x: x["priority"])
+
+    def _generate_refactoring_recommendations(self, priorities: List[Dict]) -> List[str]:
+        """Generate specific refactoring recommendations."""
+        recommendations = []
+
+        for priority in priorities:
+            if priority["category"] == "complexity":
+                recommendations.append(
+                    f"Refactor {priority['file']} - {priority['suggested_action']} to improve maintainability"
+                )
+            elif priority["category"] == "quality":
+                recommendations.append(
+                    f"Improve code quality in {priority['file']} - {priority['suggested_action']}"
+                )
+
+        if not recommendations:
+            recommendations.append("No immediate refactoring needed - codebase quality is good")
+
+        return recommendations
+
+    async def _trigger_automated_refactoring(self) -> None:
+        """Trigger automated refactoring analysis and create refactoring tasks."""
+        try:
+            # Get current codebase
+            codebase = self.assembler.get_all_files()
+            if not codebase:
+                logger.info("No codebase available for refactoring analysis")
+                return
+
+            # Analyze codebase quality
+            quality_report = await self.analyze_codebase_quality(codebase)
+
+            logger.info(f"Automated refactoring analysis complete. Overall score: {quality_report['overall_score']:.2f}")
+
+            # Check if refactoring is needed
+            if quality_report['overall_score'] >= 0.8:
+                logger.info("Codebase quality is good. No immediate refactoring needed.")
+                return
+
+            # Create specific refactoring tasks based on priorities
+            priorities = quality_report.get('refactoring_priorities', [])
+            if not priorities:
+                logger.info("No specific refactoring priorities identified")
+                return
+
+            # Take the top priority refactoring opportunity
+            top_priority = priorities[0]
+            logger.info(f"Creating refactoring task for: {top_priority['file']} - {top_priority['reason']}")
+
+            # Create a refactoring task
+            refactoring_task = {
+                "task_type": TaskType.REFACTOR.value,
+                "task_description": f"Refactor {top_priority['file']} - {top_priority['suggested_action']}",
+                "details": {
+                    "target_file": top_priority["file"],
+                    "refactoring_type": top_priority["category"],
+                    "reason": top_priority["reason"],
+                    "impact": top_priority["impact"],
+                    "quality_report": quality_report
+                }
+            }
+
+            # Add to front of task queue (high priority)
+            self.project_state.task_queue.insert(0, refactoring_task)
+
+            logger.info(f"Queued refactoring task: {refactoring_task['task_description']}")
+
+        except Exception as e:
+            logger.warning(f"Failed to trigger automated refactoring: {e}")
+
+    async def _execute_refactoring_task(self, task: Dict, dev_strategy: str) -> Tuple[bool, str]:
+        """Execute a refactoring task to improve code quality."""
+        try:
+            target_file = task.get("details", {}).get("target_file")
+            refactoring_type = task.get("details", {}).get("refactoring_type")
+            reason = task.get("details", {}).get("reason", "Code quality improvement")
+
+            if not target_file:
+                return False, "Refactoring task requires a 'target_file'."
+
+            logger.info(f"Executing refactoring task for {target_file}: {reason}")
+
+            # Get current code
+            current_code = self.assembler.get_file(target_file)
+            if not current_code:
+                return False, f"Target file {target_file} not found in codebase."
+
+            # Generate refactored code
+            refactored_code = await self._generate_refactored_code(
+                current_code,
+                target_file,
+                refactoring_type,
+                reason,
+                dev_strategy
+            )
+
+            if refactored_code:
+                # Apply the refactoring
+                self.assembler.add_file(target_file, refactored_code)
+                self.assembler.write_files_to_disk()
+
+                logger.info(f"Successfully refactored {target_file}")
+                return True, f"Refactored {target_file} for {reason}."
+
+            return False, f"Failed to generate refactored code for {target_file}."
+
+        except Exception as e:
+            logger.error(f"Error executing refactoring task: {e}")
+            return False, f"Refactoring failed: {str(e)}"
+
+    async def _generate_refactored_code(
+        self,
+        current_code: str,
+        file_name: str,
+        refactoring_type: str,
+        reason: str,
+        dev_strategy: str
+    ) -> Optional[str]:
+        """Generate refactored code based on the refactoring type and reason."""
+        try:
+            # Create refactoring prompt based on type
+            if refactoring_type == "complexity":
+                prompt = (
+                    f"You are a senior software engineer specializing in code refactoring. Your task is to refactor the following code to reduce cyclomatic complexity while maintaining the same functionality.\n\n"
+                    f"TARGET FILE: {file_name}\n"
+                    f"REFACTORING REASON: {reason}\n"
+                    f"CURRENT CODE:\n{current_code}\n\n"
+                    "REFACTORING REQUIREMENTS:\n"
+                    "• Break down complex functions into smaller, more manageable functions (keep complexity under 10)\n"
+                    "• Extract common logic into separate helper functions\n"
+                    "• Use early returns to reduce nesting\n"
+                    "• Add clear function names that describe their purpose\n"
+                    "• Maintain all existing functionality\n"
+                    "• Keep the same interface and API\n"
+                    "• Add comprehensive docstrings for new functions\n"
+                    "• Use type hints where appropriate\n\n"
+                    "Provide ONLY the refactored code without markdown fences or explanations."
+                )
+            elif refactoring_type == "quality":
+                prompt = (
+                    f"You are a senior software engineer specializing in code quality improvement. Your task is to improve the code quality while maintaining functionality.\n\n"
+                    f"TARGET FILE: {file_name}\n"
+                    f"REFACTORING REASON: {reason}\n"
+                    f"CURRENT CODE:\n{current_code}\n\n"
+                    "QUALITY IMPROVEMENT REQUIREMENTS:\n"
+                    "• Add comprehensive Google-style docstrings to all public functions and classes\n"
+                    "• Add type hints to function parameters and return types\n"
+                    "• Implement proper error handling with try/catch blocks\n"
+                    "• Add structured logging statements\n"
+                    "• Improve variable names for clarity\n"
+                    "• Break down long functions into smaller, focused functions\n"
+                    "• Add input validation where appropriate\n"
+                    "• Maintain all existing functionality\n"
+                    "• Keep the same interface and API\n\n"
+                    "Provide ONLY the refactored code without markdown fences or explanations."
+                )
+            else:
+                prompt = (
+                    f"You are a senior software engineer. Your task is to refactor the following code to improve its overall quality and maintainability.\n\n"
+                    f"TARGET FILE: {file_name}\n"
+                    f"REFACTORING REASON: {reason}\n"
+                    f"CURRENT CODE:\n{current_code}\n\n"
+                    "GENERAL REFACTORING REQUIREMENTS:\n"
+                    "• Improve code structure and organization\n"
+                    "• Add comprehensive docstrings and type hints\n"
+                    "• Implement proper error handling\n"
+                    "• Add appropriate logging\n"
+                    "• Reduce complexity where possible\n"
+                    "• Maintain all existing functionality\n"
+                    "• Keep the same interface and API\n\n"
+                    "Provide ONLY the refactored code without markdown fences or explanations."
+                )
+
+            # Generate refactored code
+            refactored_code = await self._make_api_call(
+                prompt,
+                "Code Quality Engineer",
+                cognitive_state=self.project_state.cognitive_state,
+                dev_strategy=dev_strategy,
+            )
+
+            return self._clean_code(refactored_code, Path(file_name).suffix[1:])
+
+        except Exception as e:
+            logger.error(f"Error generating refactored code: {e}")
+            return None
+
+    def _check_code_complexity(self, code: str) -> int:
+        """Check the cyclomatic complexity of generated code using radon."""
+        try:
+            # Try to import radon
+            import radon.complexity as radon_complexity
+
+            # Calculate complexity
+            complexity_visitor = radon_complexity.ComplexityVisitor.from_code(code)
+            if complexity_visitor.functions:
+                # Return the maximum complexity found
+                max_complexity = max(func.complexity for func in complexity_visitor.functions)
+                logger.info(f"Code complexity analysis: {len(complexity_visitor.functions)} functions, max complexity: {max_complexity}")
+                return max_complexity
+            else:
+                logger.info("No functions found in code for complexity analysis")
+                return 1  # No functions = minimal complexity
+        except ImportError:
+            logger.warning("Radon not available for complexity analysis. Skipping complexity check.")
+            return 1  # Assume low complexity if we can't check
+        except Exception as e:
+            logger.warning(f"Error during complexity analysis: {e}. Skipping complexity check.")
+            return 1  # Assume low complexity if there's an error
 
     async def code_reviewer(
         self,
@@ -5861,6 +6640,7 @@ Backend: http://localhost:8000/health
             elif task_type in [
                 TaskType.TDD_IMPLEMENTATION.value,
                 TaskType.CODE_MODIFICATION.value,
+                TaskType.REFACTOR.value,
                 TaskType.CREATE_DOCKERFILE.value,
                 TaskType.SETUP_CI_PIPELINE.value,
             ]:
@@ -6144,6 +6924,10 @@ Backend: http://localhost:8000/health
 
         language = file_blueprint.language
 
+        # Handle refactoring tasks specially
+        if task.get("task_type") == TaskType.REFACTOR.value:
+            return await self._execute_refactoring_task(task, dev_strategy)
+
         feedback = None
 
         # Strict TDD: write tests first, then implement code until tests pass
@@ -6241,9 +7025,26 @@ Backend: http://localhost:8000/health
                     logger.info(f"Code for {target_file} passed validation.")
                     self.assembler.add_file(target_file, generated_code)
                     self.assembler.write_files_to_disk()
+
+                    # Extract and store code patterns from successful, high-quality code
+                    await self.extract_and_store_code_patterns(
+                        generated_code,
+                        target_file,
+                        self.project_state.goal,
+                        dev_strategy,
+                        self.project_state.cognitive_state
+                    )
+
                     # Update file activity counter
                     cnt = self.project_state.file_activity_counts.get(target_file, 0)
                     self.project_state.file_activity_counts[target_file] = cnt + 1
+
+                    # Automated refactoring loop: After every N development tasks, trigger refactoring
+                    refactoring_trigger_interval = getattr(config, 'refactoring_trigger_interval', 5)
+                    if len(self.project_state.completed_tasks) % refactoring_trigger_interval == 0:
+                        logger.info(f"Completed {len(self.project_state.completed_tasks)} tasks. Triggering automated refactoring analysis...")
+                        await self._trigger_automated_refactoring()
+
                     return (
                         True,
                         f"Successfully generated and validated code for {target_file}.",
