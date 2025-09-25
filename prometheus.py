@@ -4851,17 +4851,21 @@ Backend: http://localhost:8000/health
                         task_desc = task_response.get("task_description", "")
                         logger.info(f"Task completed: {task_desc}")
 
-                        # Remove the corresponding story from sprint backlog
-                        stories_removed = 0
-                        for i, story in enumerate(self.project_state.sprint_backlog[:]):  # Create copy to avoid modification during iteration
-                            story_desc = story.get("description", "")
-                            if story_desc in task_desc or task_desc in story_desc:
-                                self.project_state.sprint_backlog.pop(i)
-                                logger.info(f"Removed completed story from sprint backlog: {story_desc}")
-                                stories_removed += 1
+                        # Skip removal for "diversify focus" tasks as they are not real user stories
+                        if "Diversify focus:" in task_desc:
+                            logger.info("Skipping sprint backlog cleanup for diversify task (not a real user story)")
+                        else:
+                            # Remove the corresponding story from sprint backlog
+                            stories_removed = 0
+                            for i, story in enumerate(self.project_state.sprint_backlog[:]):  # Create copy to avoid modification during iteration
+                                story_desc = story.get("description", "")
+                                if story_desc in task_desc or task_desc in story_desc:
+                                    self.project_state.sprint_backlog.pop(i)
+                                    logger.info(f"Removed completed story from sprint backlog: {story_desc}")
+                                    stories_removed += 1
 
-                        if stories_removed == 0:
-                            logger.warning(f"No matching story found in sprint backlog for task: {task_desc}")
+                            if stories_removed == 0:
+                                logger.warning(f"No matching story found in sprint backlog for task: {task_desc}")
 
                         logger.info(f"Sprint backlog now has {len(self.project_state.sprint_backlog)} items")
 
@@ -5244,6 +5248,10 @@ Backend: http://localhost:8000/health
                 if available_files:
                     alt = available_files[0]  # Pick the first available alternative
                     logger.info(f"Diversifying from {primary_overworked} to {alt}")
+                    # Reset the counter for the overworked file to prevent immediate re-diversification
+                    self.project_state.file_activity_counts[primary_overworked] = 0
+                    logger.info(f"Reset edit count for {primary_overworked} after diversification")
+
                     return {
                         "task_type": TaskType.TDD_IMPLEMENTATION.value,
                         "task_description": f"Diversify focus: implement story part in {alt}",
@@ -5275,53 +5283,64 @@ Backend: http://localhost:8000/health
 
                 logger.info(f"Enqueuing {len(to_enqueue)} tasks from sprint backlog. Remaining: {len(self.project_state.sprint_backlog)}")
 
-                candidate_files = [
-                    f.filename for f in self.project_state.living_blueprint.root if f.filename.endswith(".py")
-                ]
-                if not candidate_files:
-                    candidate_files = ["src/agent.py"]
+                # If no tasks were enqueued (empty sprint backlog), skip to CEO Strategist
+                if not to_enqueue:
+                    logger.warning("Sprint backlog is empty - no tasks to enqueue")
+                    # Don't continue with task generation - let it fall through to CEO Strategist
+                else:
+                    candidate_files = [
+                        f.filename for f in self.project_state.living_blueprint.root if f.filename.endswith(".py")
+                    ]
+                    if not candidate_files:
+                        candidate_files = ["src/agent.py"]
 
-                for story in to_enqueue:
-                    # Round-robin file assignment to spread work and avoid churn
-                    idx = self.project_state.file_rotation_idx % len(candidate_files)
-                    target_file = candidate_files[idx]
-                    self.project_state.file_rotation_idx += 1
+                        for story in to_enqueue:
+                            # Round-robin file assignment to spread work and avoid churn
+                            idx = self.project_state.file_rotation_idx % len(candidate_files)
+                            target_file = candidate_files[idx]
+                            self.project_state.file_rotation_idx += 1
 
-                    # Check if this task was recently completed to avoid duplicates
-                    story_desc = story.get('description', 'Story')
-                    task_desc = f"Implement user story: {story_desc} in {target_file}"
-                    recent_tasks = self.project_state.completed_tasks[-10:]  # Check last 10 tasks
+                            # Check if this task was recently completed to avoid duplicates
+                            story_desc = story.get('description', 'Story')
+                            task_desc = f"Implement user story: {story_desc} in {target_file}"
+                            recent_tasks = self.project_state.completed_tasks[-10:]  # Check last 10 tasks
 
-                    if any(task_desc in recent_task or recent_task in task_desc for recent_task in recent_tasks):
-                        logger.info(f"Skipping duplicate task: {task_desc}")
-                        continue
+                            if any(task_desc in recent_task or recent_task in task_desc for recent_task in recent_tasks):
+                                logger.info(f"Skipping duplicate task: {task_desc}")
+                                continue
 
-                    # Prioritize tasks that create missing files (breadth-first)
-                    if target_file not in self.assembler.get_all_files():
-                        self.project_state.task_queue.insert(
-                            0,
-                            {
-                                "task_type": TaskType.TDD_IMPLEMENTATION.value,
-                                "task_description": f"Create and implement: {story_desc} in {target_file}",
-                                "details": {
-                                    "target_file": target_file,
-                                    "acceptance_criteria": story.get("acceptance_criteria", []),
-                                    "story_points": story.get("story_points", 1),
-                                },
-                            },
-                        )
-                        continue
-                    self.project_state.task_queue.append(
-                        {
-                            "task_type": TaskType.TDD_IMPLEMENTATION.value,
-                            "task_description": task_desc,
-                            "details": {
-                                "target_file": target_file,
-                                "acceptance_criteria": story.get("acceptance_criteria", []),
-                                "story_points": story.get("story_points", 1),
-                            },
-                        }
-                    )
+                            # Also check for recently completed diversify tasks to avoid immediate re-diversification
+                            diversify_task_desc = f"Diversify focus: implement story part in {target_file}"
+                            if any(diversify_task_desc in recent_task for recent_task in recent_tasks):
+                                logger.info(f"Skipping task - recently completed diversify task for {target_file}: {task_desc}")
+                                continue
+
+                            # Prioritize tasks that create missing files (breadth-first)
+                            if target_file not in self.assembler.get_all_files():
+                                self.project_state.task_queue.insert(
+                                    0,
+                                    {
+                                        "task_type": TaskType.TDD_IMPLEMENTATION.value,
+                                        "task_description": f"Create and implement: {story_desc} in {target_file}",
+                                        "details": {
+                                            "target_file": target_file,
+                                            "acceptance_criteria": story.get("acceptance_criteria", []),
+                                            "story_points": story.get("story_points", 1),
+                                        },
+                                    },
+                                )
+                                continue
+                            self.project_state.task_queue.append(
+                                {
+                                    "task_type": TaskType.TDD_IMPLEMENTATION.value,
+                                    "task_description": task_desc,
+                                    "details": {
+                                        "target_file": target_file,
+                                        "acceptance_criteria": story.get("acceptance_criteria", []),
+                                        "story_points": story.get("story_points", 1),
+                                    },
+                                }
+                            )
 
             if self.project_state.task_queue:
                 return self.project_state.task_queue.pop(0)
@@ -5351,6 +5370,21 @@ Backend: http://localhost:8000/health
 
         # If queue is empty, ask CEO for the next task
         logger.info("Task queue is empty. Consulting CEO Strategist...")
+
+        # Check if we've been consulting CEO Strategist too many times recently (potential loop)
+        recent_tasks = self.project_state.completed_tasks[-5:]
+        ceo_consultations = [task for task in recent_tasks if "CEO Strategist" in task or "consulting CEO" in task.lower()]
+
+        if len(ceo_consultations) >= 3:
+            logger.warning("Consulted CEO Strategist 3+ times recently - this might indicate a loop. Checking goal achievement.")
+            # Force a goal achievement check
+            goal_achieved = await self.check_goal_achievement(None)
+            if goal_achieved:
+                logger.info("Goal appears to be achieved despite empty task queue.")
+                return None
+            else:
+                logger.warning("Goal not achieved but no tasks available. This might be a planning issue.")
+
         query_text_for_ceo = (
             json.dumps(self.project_state.goal)
             if isinstance(self.project_state.goal, dict)
