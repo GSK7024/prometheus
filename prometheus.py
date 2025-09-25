@@ -1343,8 +1343,9 @@ class ProjectState:
     cognitive_state: Dict[str, Any] = field(default_factory=dict)
     evolutionary_path: List[Dict] = field(default_factory=list)
     # Agile specific state
-    epics: List[str] = field(default_factory=list)
+    epics: List[Dict] = field(default_factory=list)  # Changed to List[Dict] to store epic details
     current_epic: Optional[str] = None
+    current_epic_index: int = 0  # Track which epic we're currently working on
     # Cognitive specific state
     current_strategy: str = "tdd"
     # Agile enhancements
@@ -4791,6 +4792,10 @@ Backend: http://localhost:8000/health
 
             # Maximum task execution limit to prevent infinite loops
             max_tasks = getattr(config, "max_tasks_per_run", 100)
+            # Sprint tracking for Agile
+            sprint_task_count = 0
+            sprint_duration = config.strategy_configs[DevelopmentStrategy.AGILE.value].get("sprint_duration", 14)
+            sprint_batch_size = config.strategy_configs[DevelopmentStrategy.AGILE.value].get("sprint_batch_size", 5)
 
             while not goal_achieved:
                 # Prevent infinite loops - emergency brake
@@ -4806,18 +4811,27 @@ Backend: http://localhost:8000/health
                     await self._adjust_cognitive_state()
                     continue
 
-                # Strategy-specific loops
-                if (
-                    self.project_state.development_strategy
-                    == DevelopmentStrategy.AGILE.value
-                    and sprint_count > 0
-                    and sprint_count
-                    % config.strategy_configs[DevelopmentStrategy.AGILE.value][
-                        "sprint_duration"
-                    ]
-                    == 0
-                ):
-                    await self.execute_sprint_review()
+                # Agile-specific sprint management
+                if self.project_state.development_strategy == DevelopmentStrategy.AGILE.value:
+                    sprint_task_count += 1
+
+                    # Execute sprint review every sprint_duration tasks (not days)
+                    if sprint_task_count >= sprint_duration:
+                        logger.info(f"Completing sprint after {sprint_task_count} tasks. Executing sprint review...")
+                        await self.execute_sprint_review()
+                        sprint_task_count = 0  # Reset sprint counter
+
+                        # Update sprint velocity
+                        completed_this_sprint = len([t for t in self.project_state.completed_tasks[-sprint_duration:]])
+                        logger.info(f"Sprint velocity: {completed_this_sprint} tasks completed in this sprint")
+
+                    # Update current epic if we're in Agile mode
+                    if self.project_state.epics:
+                        current_epic_idx = getattr(self.project_state, 'current_epic_index', 0)
+                        if current_epic_idx < len(self.project_state.epics):
+                            self.project_state.current_epic = self.project_state.epics[current_epic_idx].get('description', 'Unknown Epic')
+                        else:
+                            self.project_state.current_epic = "All epics completed"
 
                 # Get next task with cognitive optimization
                 task_response = await self.get_next_task(last_task_result)
@@ -5275,8 +5289,9 @@ Backend: http://localhost:8000/health
 
             # If no queued tasks and sprint backlog exists, pre-enqueue a batch of tasks
             if self.project_state.sprint_backlog and not self.project_state.task_queue:
+                # Use the sprint_batch_size from the main loop for consistency
                 batch_size = config.strategy_configs[DevelopmentStrategy.AGILE.value].get(
-                    "sprint_batch_size", 3
+                    "sprint_batch_size", 5
                 )
                 to_enqueue = self.project_state.sprint_backlog[:batch_size]
                 self.project_state.sprint_backlog = self.project_state.sprint_backlog[batch_size:]
@@ -5287,6 +5302,7 @@ Backend: http://localhost:8000/health
                 if not to_enqueue:
                     logger.warning("Sprint backlog is empty - no tasks to enqueue")
                     # Don't continue with task generation - let it fall through to CEO Strategist
+                    return None
                 else:
                     candidate_files = [
                         f.filename for f in self.project_state.living_blueprint.root if f.filename.endswith(".py")
@@ -5294,73 +5310,83 @@ Backend: http://localhost:8000/health
                     if not candidate_files:
                         candidate_files = ["src/agent.py"]
 
-                        for story in to_enqueue:
-                            # Round-robin file assignment to spread work and avoid churn
-                            idx = self.project_state.file_rotation_idx % len(candidate_files)
-                            target_file = candidate_files[idx]
-                            self.project_state.file_rotation_idx += 1
+                    for story in to_enqueue:
+                        # Round-robin file assignment to spread work and avoid churn
+                        idx = self.project_state.file_rotation_idx % len(candidate_files)
+                        target_file = candidate_files[idx]
+                        self.project_state.file_rotation_idx += 1
 
-                            # Check if this task was recently completed to avoid duplicates
-                            story_desc = story.get('description', 'Story')
-                            task_desc = f"Implement user story: {story_desc} in {target_file}"
-                            recent_tasks = self.project_state.completed_tasks[-10:]  # Check last 10 tasks
+                        # Check if this task was recently completed to avoid duplicates
+                        story_desc = story.get('description', 'Story')
+                        task_desc = f"Implement user story: {story_desc} in {target_file}"
+                        recent_tasks = self.project_state.completed_tasks[-10:]  # Check last 10 tasks
 
-                            if any(task_desc in recent_task or recent_task in task_desc for recent_task in recent_tasks):
-                                logger.info(f"Skipping duplicate task: {task_desc}")
-                                continue
+                        if any(task_desc in recent_task or recent_task in task_desc for recent_task in recent_tasks):
+                            logger.info(f"Skipping duplicate task: {task_desc}")
+                            continue
 
-                            # Also check for recently completed diversify tasks to avoid immediate re-diversification
-                            diversify_task_desc = f"Diversify focus: implement story part in {target_file}"
-                            if any(diversify_task_desc in recent_task for recent_task in recent_tasks):
-                                logger.info(f"Skipping task - recently completed diversify task for {target_file}: {task_desc}")
-                                continue
+                        # Also check for recently completed diversify tasks to avoid immediate re-diversification
+                        diversify_task_desc = f"Diversify focus: implement story part in {target_file}"
+                        if any(diversify_task_desc in recent_task for recent_task in recent_tasks):
+                            logger.info(f"Skipping task - recently completed diversify task for {target_file}: {task_desc}")
+                            continue
 
-                            # Prioritize tasks that create missing files (breadth-first)
-                            if target_file not in self.assembler.get_all_files():
-                                self.project_state.task_queue.insert(
-                                    0,
-                                    {
-                                        "task_type": TaskType.TDD_IMPLEMENTATION.value,
-                                        "task_description": f"Create and implement: {story_desc} in {target_file}",
-                                        "details": {
-                                            "target_file": target_file,
-                                            "acceptance_criteria": story.get("acceptance_criteria", []),
-                                            "story_points": story.get("story_points", 1),
-                                        },
-                                    },
-                                )
-                                continue
-                            self.project_state.task_queue.append(
+                        # Prioritize tasks that create missing files (breadth-first)
+                        if target_file not in self.assembler.get_all_files():
+                            self.project_state.task_queue.insert(
+                                0,
                                 {
                                     "task_type": TaskType.TDD_IMPLEMENTATION.value,
-                                    "task_description": task_desc,
+                                    "task_description": f"Create and implement: {story_desc} in {target_file}",
                                     "details": {
                                         "target_file": target_file,
                                         "acceptance_criteria": story.get("acceptance_criteria", []),
                                         "story_points": story.get("story_points", 1),
                                     },
-                                }
+                                },
                             )
+                            continue
+                        self.project_state.task_queue.append(
+                            {
+                                "task_type": TaskType.TDD_IMPLEMENTATION.value,
+                                "task_description": task_desc,
+                                "details": {
+                                    "target_file": target_file,
+                                    "acceptance_criteria": story.get("acceptance_criteria", []),
+                                    "story_points": story.get("story_points", 1),
+                                },
+                            }
+                        )
 
             if self.project_state.task_queue:
                 return self.project_state.task_queue.pop(0)
 
             if self.project_state.sprint_backlog:
                 story = self.project_state.sprint_backlog.pop(0)
+                logger.info(f"Processing story from sprint backlog: {story.get('description', 'Unknown')[:50]}...")
+
                 # Heuristic: pick a sensible target file from blueprint
-                candidate_files = [f.filename for f in self.project_state.living_blueprint.root]
-                target_file = None
-                for fname in candidate_files:
-                    if fname.endswith(".py") and not fname.startswith("tests/"):
-                        target_file = fname
-                        break
-                if not target_file:
-                    target_file = candidate_files[0] if candidate_files else "src/agent.py"
+                candidate_files = [f.filename for f in self.project_state.living_blueprint.root if f.filename.endswith(".py")]
+                if not candidate_files:
+                    candidate_files = ["src/agent.py"]
+
+                # Use round-robin assignment to distribute work
+                target_file = candidate_files[self.project_state.file_rotation_idx % len(candidate_files)]
+                self.project_state.file_rotation_idx += 1
+
+                # Check if this story was recently completed to avoid duplicates
+                story_desc = story.get('description', 'Story')
+                task_desc = f"Implement user story: {story_desc} in {target_file}"
+                recent_tasks = self.project_state.completed_tasks[-5:]
+
+                if any(story_desc in recent_task for recent_task in recent_tasks):
+                    logger.info(f"Story recently completed, skipping: {story_desc[:50]}...")
+                    return None  # This will trigger CEO Strategist consultation
 
                 return {
                     # Prefer TDD for new story implementation to ensure tests
                     "task_type": TaskType.TDD_IMPLEMENTATION.value,
-                    "task_description": f"Implement user story: {story.get('description', 'Story')} in {target_file}",
+                    "task_description": task_desc,
                     "details": {
                         "target_file": target_file,
                         "acceptance_criteria": story.get("acceptance_criteria", []),
@@ -5403,18 +5429,75 @@ Backend: http://localhost:8000/health
 
     async def check_goal_achievement(self, last_task_result: str) -> bool:
         """Check if the goal has been achieved based on completed tasks and results"""
+        logger.info("Checking goal achievement...")
+
+        # Check for explicit completion indicators
         if last_task_result and (
             "final" in last_task_result.lower()
             or "complete" in last_task_result.lower()
+            or "finished" in last_task_result.lower()
+            or "done" in last_task_result.lower()
         ):
+            logger.info("Goal achieved - explicit completion indicator found")
             return True
 
+        # Check for Agile-specific completion
+        if self.project_state.development_strategy == DevelopmentStrategy.AGILE.value:
+            # In Agile, check if we've completed all epics and stories
+            total_epics = len(self.project_state.epics) if self.project_state.epics else 0
+            completed_epics = getattr(self.project_state, 'current_epic_index', 0)
+
+            if total_epics > 0 and completed_epics >= total_epics:
+                logger.info(f"Goal achieved - all {total_epics} epics completed")
+                return True
+
+            # Check if we've completed a significant number of tasks
+            if len(self.project_state.completed_tasks) >= 15:
+                # Check if sprint backlog is empty (no more work to do)
+                if not self.project_state.sprint_backlog:
+                    logger.info("Goal achieved - significant progress made and no remaining sprint backlog")
+                    return True
+
+        # Check for general completion criteria
         if (
             self.assembler.check_project_size_limits()
             and len(self.project_state.completed_tasks) > 5
         ):
+            logger.info("Goal achieved - project size limits reached with sufficient tasks completed")
             return True
 
+        # Check for substantial progress
+        if len(self.project_state.completed_tasks) >= 10:
+            # Generate a goal achievement assessment
+            assessment_prompt = f"""
+            Assess if the following goal has been achieved:
+
+            Goal: {self.project_state.goal}
+
+            Completed tasks: {len(self.project_state.completed_tasks)}
+            Task descriptions: {self.project_state.completed_tasks[-10:]}  # Last 10 tasks
+
+            Project files created: {len(self.assembler.get_all_files())}
+
+            Based on the completed work, has the goal been substantially achieved?
+            Answer with YES or NO, followed by a brief explanation.
+            """
+
+            try:
+                assessment = await self.ai._make_api_call(
+                    assessment_prompt,
+                    "GoalAssessment",
+                    is_json=False,
+                    cognitive_state=self.project_state.cognitive_state,
+                )
+
+                if "YES" in assessment.upper()[:50]:  # Check first 50 characters
+                    logger.info(f"Goal achieved based on AI assessment: {assessment[:100]}...")
+                    return True
+            except Exception as e:
+                logger.warning(f"Could not assess goal achievement: {e}")
+
+        logger.info(f"Goal not yet achieved. Tasks completed: {len(self.project_state.completed_tasks)}")
         return False
 
     async def save_state(self):
@@ -5620,18 +5703,52 @@ Backend: http://localhost:8000/health
                     if isinstance(self.project_state.goal, dict)
                     else self.project_state.goal
                 )
-                self.project_state.epics = await self.ai.epic_planner(
+
+                # Get epic planning results
+                epic_results = await self.ai.epic_planner(
                     query_text,
                     [],
                     self.project_state.cognitive_state,
                     self.project_state.development_strategy,
                 )
-                return True, "Epics planned successfully."
+
+                # Convert epics to dictionary format with additional metadata
+                if isinstance(epic_results, list):
+                    self.project_state.epics = []
+                    for i, epic in enumerate(epic_results):
+                        if isinstance(epic, dict):
+                            epic_dict = {
+                                "id": f"epic_{i}",
+                                "description": epic.get("description", str(epic)),
+                                "story_points": epic.get("story_points", 20),
+                                "status": "planned",
+                                "created_at": time.time()
+                            }
+                            self.project_state.epics.append(epic_dict)
+                        else:
+                            # Handle string epics
+                            epic_dict = {
+                                "id": f"epic_{i}",
+                                "description": str(epic),
+                                "story_points": 20,
+                                "status": "planned",
+                                "created_at": time.time()
+                            }
+                            self.project_state.epics.append(epic_dict)
+
+                # Set current epic
+                if self.project_state.epics:
+                    self.project_state.current_epic = self.project_state.epics[0].get("description")
+                    self.project_state.current_epic_index = 0
+                    logger.info(f"Planned {len(self.project_state.epics)} epics. Starting with: {self.project_state.current_epic[:50]}...")
+                    return True, f"Planned {len(self.project_state.epics)} epics successfully."
+                else:
+                    return False, "No epics were generated."
             else:
                 logger.info(
-                    "Epics have already been planned. Skipping PLAN_EPICS task."
+                    f"Epics already planned ({len(self.project_state.epics)} epics). Skipping PLAN_EPICS task."
                 )
-                return True, "Epics already planned."
+                return True, f"Epics already planned ({len(self.project_state.epics)} epics)."
 
         if task_type == TaskType.USER_STORY_REFINEMENT.value:
             epic_to_refine = task["details"].get("epic")
@@ -5640,9 +5757,16 @@ Backend: http://localhost:8000/health
                     "USER_STORY_REFINEMENT task is missing an 'epic' in details. Inferring from project state."
                 )
                 if self.project_state.epics:
-                    # Infer the first epic as the one to work on.
-                    epic_to_refine = self.project_state.epics[0].get("description")
-                    logger.info(f"Inferred epic to refine: '{epic_to_refine[:50]}...'")
+                    # Use current epic index to determine which epic to work on
+                    current_epic_idx = getattr(self.project_state, 'current_epic_index', 0)
+                    if current_epic_idx < len(self.project_state.epics):
+                        epic_to_refine = self.project_state.epics[current_epic_idx].get("description")
+                        logger.info(f"Refining epic {current_epic_idx + 1}/{len(self.project_state.epics)}: '{epic_to_refine[:50]}...'")
+                    else:
+                        # All epics completed, refine the last one or create a new batch
+                        if self.project_state.epics:
+                            epic_to_refine = self.project_state.epics[-1].get("description")
+                            logger.info(f"All epics completed, re-refining last epic: '{epic_to_refine[:50]}...'")
                 else:
                     return (
                         False,
@@ -5656,9 +5780,27 @@ Backend: http://localhost:8000/health
                 )
 
             stories = await self._refine_user_stories(epic_to_refine)
-            self.project_state.user_stories.extend(stories)
-            self.project_state.sprint_backlog = stories[:5]  # Top 5 for sprint
-            return True, f"Refined {len(stories)} user stories."
+
+            if stories:
+                self.project_state.user_stories.extend(stories)
+                # Add to sprint backlog, prioritizing based on story points
+                sprint_backlog_size = config.strategy_configs[DevelopmentStrategy.AGILE.value].get("sprint_batch_size", 5)
+
+                # Sort by story points (smaller first) for better sprint planning
+                stories_sorted = sorted(stories, key=lambda x: x.get('story_points', 1))
+                new_sprint_items = stories_sorted[:sprint_backlog_size]
+
+                # Add to existing sprint backlog
+                self.project_state.sprint_backlog.extend(new_sprint_items)
+
+                # Update current epic index if we completed all stories for current epic
+                current_epic_idx = getattr(self.project_state, 'current_epic_index', 0)
+                if current_epic_idx < len(self.project_state.epics) - 1:
+                    self.project_state.current_epic_index = current_epic_idx + 1
+
+                return True, f"Refined {len(stories)} user stories. Added {len(new_sprint_items)} to sprint backlog."
+            else:
+                return False, "No user stories were generated from epic refinement."
 
         elif task_type == TaskType.SPRINT_REVIEW.value:
             await self.execute_sprint_review()
@@ -5972,25 +6114,86 @@ Backend: http://localhost:8000/health
 
     async def execute_sprint_review(self):
         """Agile sprint review and retrospective."""
-        retrospective_prompt = f"Review sprint for {self.project_state.current_epic}"
-        retrospective = await self.ai._make_api_call(
-            retrospective_prompt,
-            "Retrospective",
-            is_json=False,
-            cognitive_state=self.project_state.cognitive_state,
-            dev_strategy=DevelopmentStrategy.AGILE.value,
-        )
-        self.project_state.velocity_history.append(
-            len([t for t in self.project_state.completed_tasks if "sprint" in str(t)])
-        )
+        logger.info("Executing Agile sprint review and retrospective...")
+
+        # Get sprint statistics
+        all_completed_tasks = self.project_state.completed_tasks
+        sprint_start_idx = max(0, len(all_completed_tasks) - 14)  # Last 14 tasks for this sprint
+        sprint_tasks = all_completed_tasks[sprint_start_idx:]
+
+        # Calculate velocity (tasks completed in this sprint)
+        velocity = len(sprint_tasks)
+
+        # Update velocity history
+        self.project_state.velocity_history.append(velocity)
+        logger.info(f"Sprint velocity: {velocity} tasks completed")
+
+        # Calculate average velocity across all sprints
+        avg_velocity = sum(self.project_state.velocity_history) / len(self.project_state.velocity_history) if self.project_state.velocity_history else 0
+        logger.info(f"Average velocity across all sprints: {avg_velocity".1f"} tasks")
+
+        # Update current epic progress
+        if self.project_state.epics:
+            current_epic_idx = getattr(self.project_state, 'current_epic_index', 0)
+            if current_epic_idx < len(self.project_state.epics):
+                current_epic = self.project_state.epics[current_epic_idx]
+                completed_stories = len([t for t in sprint_tasks if "user story" in t.lower() or "implement" in t.lower()])
+                epic_story_points = sum(story.get('story_points', 1) for story in self.project_state.user_stories[:5])  # Top 5 stories
+
+                logger.info(f"Current epic: {current_epic.get('description', 'Unknown')[:50]}...")
+                logger.info(f"Stories completed this sprint: {completed_stories}")
+                logger.info(f"Estimated epic progress: {completed_stories}/5 stories")
+
+        # Generate retrospective insights
+        retrospective_prompt = f"""
+        Perform an Agile retrospective for the completed sprint.
+
+        Sprint Statistics:
+        - Tasks completed: {velocity}
+        - Average velocity: {avg_velocity".1f"}
+        - Total completed tasks: {len(all_completed_tasks)}
+
+        Current project state:
+        - Goal: {self.project_state.goal}
+        - Epics planned: {len(self.project_state.epics) if self.project_state.epics else 0}
+        - User stories in backlog: {len(self.project_state.user_stories)}
+
+        Provide insights on:
+        1. What went well in this sprint
+        2. What could be improved
+        3. Action items for next sprint
+        4. Sprint predictability assessment
+        """
+
+        try:
+            retrospective = await self.ai._make_api_call(
+                retrospective_prompt,
+                "Retrospective",
+                is_json=False,
+                cognitive_state=self.project_state.cognitive_state,
+                dev_strategy=DevelopmentStrategy.AGILE.value,
+            )
+            logger.info(f"Retrospective insights: {retrospective[:200]}...")
+        except Exception as e:
+            logger.warning(f"Could not generate retrospective: {e}")
+            retrospective = "Retrospective generation failed, but sprint review completed."
+
+        # Store retrospective in memory
         self.memory.add_memory(
             self.goal,
             self.project_state.living_blueprint,
-            strategy=["agile"],
+            strategy=["agile", "retrospective"],
             cognitive_state=self.project_state.cognitive_state,
             dev_strategy=DevelopmentStrategy.AGILE.value,
+            metadata={
+                "sprint_velocity": velocity,
+                "average_velocity": avg_velocity,
+                "sprint_retrospective": retrospective,
+                "completed_tasks": len(all_completed_tasks)
+            }
         )
-        logger.info("Sprint review and retrospective completed.")
+
+        logger.info(f"Sprint review completed. Velocity: {velocity}, Average: {avg_velocity".1f"}")
 
     async def _init_git_repo(self):
         """Initialize Git for DevOps."""
