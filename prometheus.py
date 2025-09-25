@@ -1501,6 +1501,7 @@ class NeuromorphicMemoryManager:
         embeddings: Optional[Dict[str, List[float]]] = None,
         cognitive_state: Dict = None,
         dev_strategy: str = None,
+        metadata: Dict = None,
     ):
         if "project_blueprints" not in self.collections:
             return
@@ -1508,6 +1509,8 @@ class NeuromorphicMemoryManager:
         try:
             # Store blueprint
             blueprint_doc = f"User Goal: {goal}\n\nBlueprint:\n{blueprint.to_json()}\n\nCognitive State: {json.dumps(cognitive_state) if cognitive_state else 'N/A'}\nStrategy: {dev_strategy}"
+            if metadata:
+                blueprint_doc += f"\n\nMetadata: {json.dumps(metadata)}"
             blueprint_id = f"project_{hash(goal)}_{dev_strategy or 'default'}"
 
             # Add embeddings if provided
@@ -1525,6 +1528,8 @@ class NeuromorphicMemoryManager:
                     f"User Goal: {goal}\n\nSuccessful Strategy:\n"
                     + "\n".join(f"- {s}" for s in strategy)
                 )
+                if metadata:
+                    strategy_doc += f"\n\nMetadata: {json.dumps(metadata)}"
                 strategy_id = f"strategy_{hash(goal)}_{dev_strategy or 'default'}"
 
                 strategy_embedding = (
@@ -1563,13 +1568,17 @@ class NeuromorphicMemoryManager:
                 )
 
             # Add to neuromorphic memory
+            neuromorphic_metadata = {
+                "type": "project",
+                "strategy": strategy,
+                "cognitive_state": cognitive_state,
+            }
+            if metadata:
+                neuromorphic_metadata.update(metadata)
+
             self.neuromorphic_memory.add_memory(
                 {"goal": goal, "blueprint": blueprint.to_json()},
-                {
-                    "type": "project",
-                    "strategy": strategy,
-                    "cognitive_state": cognitive_state,
-                },
+                neuromorphic_metadata,
             )
 
             logger.info(f"Successfully saved neuromorphic memory for goal: '{goal}'")
