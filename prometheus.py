@@ -4849,12 +4849,21 @@ Backend: http://localhost:8000/health
                     # For agile strategy, remove completed stories from sprint backlog
                     if self.project_state.development_strategy == DevelopmentStrategy.AGILE.value:
                         task_desc = task_response.get("task_description", "")
+                        logger.info(f"Task completed: {task_desc}")
+
                         # Remove the corresponding story from sprint backlog
-                        for i, story in enumerate(self.project_state.sprint_backlog):
-                            if story.get("description", "") in task_desc:
+                        stories_removed = 0
+                        for i, story in enumerate(self.project_state.sprint_backlog[:]):  # Create copy to avoid modification during iteration
+                            story_desc = story.get("description", "")
+                            if story_desc in task_desc or task_desc in story_desc:
                                 self.project_state.sprint_backlog.pop(i)
-                                logger.info(f"Removed completed story from sprint backlog: {story.get('description', '')}")
-                                break
+                                logger.info(f"Removed completed story from sprint backlog: {story_desc}")
+                                stories_removed += 1
+
+                        if stories_removed == 0:
+                            logger.warning(f"No matching story found in sprint backlog for task: {task_desc}")
+
+                        logger.info(f"Sprint backlog now has {len(self.project_state.sprint_backlog)} items")
 
                     self._update_cognitive_state(success=True)
                 else:
@@ -5213,27 +5222,48 @@ Backend: http://localhost:8000/health
         # Agile: pull next user story from sprint backlog and convert into a concrete dev task
         if self.project_state.development_strategy == DevelopmentStrategy.AGILE.value:
             # Prevent infinite churn on the same file: count last N tasks by target_file
-            main_edits = self.project_state.file_activity_counts.get("main.py", 0)
-            if main_edits >= getattr(config, "max_same_file_tasks", 2):
-                # Force a different file if available in blueprint
-                alt = None
-                for f in self.project_state.living_blueprint.root:
-                    if f.filename != "main.py" and f.filename.endswith(".py"):
-                        alt = f.filename
-                        break
-                if alt:
+            # Check all files that have been worked on recently
+            overworked_files = []
+            max_same_file_tasks = getattr(config, "max_same_file_tasks", 2)
+
+            for filename, edit_count in self.project_state.file_activity_counts.items():
+                if edit_count >= max_same_file_tasks:
+                    overworked_files.append(filename)
+
+            # If any file is overworked, try to find an alternative
+            if overworked_files:
+                primary_overworked = overworked_files[0]  # Take the first overworked file
+                logger.info(f"File {primary_overworked} has been edited {self.project_state.file_activity_counts[primary_overworked]} times, looking for alternative...")
+
+                # Find available Python files that are NOT the overworked one
+                available_files = [
+                    f.filename for f in self.project_state.living_blueprint.root
+                    if f.filename.endswith(".py") and f.filename != primary_overworked
+                ]
+
+                if available_files:
+                    alt = available_files[0]  # Pick the first available alternative
+                    logger.info(f"Diversifying from {primary_overworked} to {alt}")
                     return {
                         "task_type": TaskType.TDD_IMPLEMENTATION.value,
                         "task_description": f"Diversify focus: implement story part in {alt}",
                         "details": {"target_file": alt, "acceptance_criteria": []},
                     }
                 else:
-                    # No alternative files available, continue with current file
-                    logger.info("No alternative files available for diversification, continuing with current approach")
-                    # Reset the main.py edit count to prevent getting stuck
-                    if "main.py" in self.project_state.file_activity_counts:
-                        self.project_state.file_activity_counts["main.py"] = 0
-                        logger.info("Reset main.py edit count to prevent infinite loop")
+                    # No alternative files available, reset the counter and continue
+                    logger.warning(f"No alternative files available. Available files: {[f.filename for f in self.project_state.living_blueprint.root]}")
+                    logger.info(f"Resetting edit count for {primary_overworked} to prevent infinite loop")
+                    self.project_state.file_activity_counts[primary_overworked] = 0
+
+                    # Also check if we just completed a diversify task for this same file
+                    # This prevents immediate re-generation of the same diversify task
+                    recent_tasks = self.project_state.completed_tasks[-3:]  # Check last 3 tasks
+                    for recent_task in recent_tasks:
+                        if f"Diversify focus: implement story part in {primary_overworked}" in recent_task:
+                            logger.warning(f"Just completed diversify task for {primary_overworked}, but no alternatives available. This might cause issues.")
+                            logger.info("Skipping further diversification attempts to prevent infinite loop")
+                            # Don't return anything here - let the function continue to generate regular tasks
+                            break
 
             # If no queued tasks and sprint backlog exists, pre-enqueue a batch of tasks
             if self.project_state.sprint_backlog and not self.project_state.task_queue:
@@ -5242,6 +5272,8 @@ Backend: http://localhost:8000/health
                 )
                 to_enqueue = self.project_state.sprint_backlog[:batch_size]
                 self.project_state.sprint_backlog = self.project_state.sprint_backlog[batch_size:]
+
+                logger.info(f"Enqueuing {len(to_enqueue)} tasks from sprint backlog. Remaining: {len(self.project_state.sprint_backlog)}")
 
                 candidate_files = [
                     f.filename for f in self.project_state.living_blueprint.root if f.filename.endswith(".py")
@@ -5254,13 +5286,23 @@ Backend: http://localhost:8000/health
                     idx = self.project_state.file_rotation_idx % len(candidate_files)
                     target_file = candidate_files[idx]
                     self.project_state.file_rotation_idx += 1
+
+                    # Check if this task was recently completed to avoid duplicates
+                    story_desc = story.get('description', 'Story')
+                    task_desc = f"Implement user story: {story_desc} in {target_file}"
+                    recent_tasks = self.project_state.completed_tasks[-10:]  # Check last 10 tasks
+
+                    if any(task_desc in recent_task or recent_task in task_desc for recent_task in recent_tasks):
+                        logger.info(f"Skipping duplicate task: {task_desc}")
+                        continue
+
                     # Prioritize tasks that create missing files (breadth-first)
                     if target_file not in self.assembler.get_all_files():
                         self.project_state.task_queue.insert(
                             0,
                             {
                                 "task_type": TaskType.TDD_IMPLEMENTATION.value,
-                                "task_description": f"Create and implement: {story.get('description', 'Story')} in {target_file}",
+                                "task_description": f"Create and implement: {story_desc} in {target_file}",
                                 "details": {
                                     "target_file": target_file,
                                     "acceptance_criteria": story.get("acceptance_criteria", []),
@@ -5272,7 +5314,7 @@ Backend: http://localhost:8000/health
                     self.project_state.task_queue.append(
                         {
                             "task_type": TaskType.TDD_IMPLEMENTATION.value,
-                            "task_description": f"Implement user story: {story.get('description', 'Story')} in {target_file}",
+                            "task_description": task_desc,
                             "details": {
                                 "target_file": target_file,
                                 "acceptance_criteria": story.get("acceptance_criteria", []),
