@@ -265,7 +265,7 @@ class NeuromorphicMemory:
         embedding = outputs.last_hidden_state.mean(dim=1).numpy()
         return embedding / np.linalg.norm(embedding)  # L2 normalization
 
-    def add_memory(self, data, metadata=None):
+    def add_memory(self, data, metadata=None, strategy=None, cognitive_state=None, dev_strategy=None):
         """Add memory with relevance scoring and forgetting check."""
         embedding = self.embed_text(str(data))
         if embedding is None:
@@ -287,15 +287,53 @@ class NeuromorphicMemory:
             logger.debug("Memory forgotten due to low relevance.")
             return
 
+        # Combine all metadata
+        combined_metadata = {}
+        if metadata:
+            combined_metadata.update(metadata)
+        if strategy:
+            combined_metadata["strategy"] = strategy
+        if cognitive_state:
+            combined_metadata["cognitive_state"] = cognitive_state
+        if dev_strategy:
+            combined_metadata["dev_strategy"] = dev_strategy
+
         self.memory_index.add(embedding)
         self.memory_data.append(data)
-        self.memory_metadata.append(metadata or {})
+        self.memory_metadata.append(combined_metadata)
         # Track embedding for future relevance/cluster computations
         self._embedding_store.append(embedding.squeeze(0))
 
         # Periodic clustering with forgetting
         if len(self.memory_data) % 50 == 0:  # More frequent updates
             self.update_clustering()
+
+    def _extract_core_functionality(self, text: str) -> Optional[str]:
+        """Extract core functionality from task/story description for better matching"""
+
+        # Remove common prefixes and suffixes
+        text = re.sub(r'^(as a|as the|implement|create|build|develop)\s+', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'\s+(so that|to|for|with|using).*$', '', text, flags=re.IGNORECASE)
+
+        # Extract key action words and objects
+        key_patterns = [
+            r'(create|add|build|make)\s+(new\s+)?(\w+)',
+            r'(retrieve|get|fetch|read)\s+(\w+)',
+            r'(update|modify|edit|change)\s+(\w+)',
+            r'(delete|remove|destroy)\s+(\w+)',
+            r'(mark|set)\s+(\w+)\s+(complete|done|finished)',
+            r'(validate|check|verify)\s+(\w+)'
+        ]
+
+        for pattern in key_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                return match.group(0).lower().strip()
+
+        # If no pattern matches, return the text with common words removed
+        words_to_remove = ['task', 'system', 'user', 'backend', 'developer', 'application', 'app']
+        core_words = [word for word in text.split() if word.lower() not in words_to_remove]
+        return ' '.join(core_words[:5]) if core_words else text.strip()
 
     def retrieve_similar(self, query, k=10):  # Increased k for broader recall
         """Retrieve similar memories with relevance filtering."""
@@ -1032,6 +1070,7 @@ class TaskType(Enum):
     BLUEPRINT_FILE = "BLUEPRINT_FILE"
     TDD_IMPLEMENTATION = "TDD_IMPLEMENTATION"
     CODE_MODIFICATION = "CODE_MODIFICATION"
+    REFACTOR = "REFACTOR"  # New: Code quality improvement and refactoring
     TOOL_EXECUTION = "TOOL_EXECUTION"
     ENVIRONMENT_CHECK = "ENVIRONMENT_CHECK"
     FILE_SYSTEM_REFACTORING = "FILE_SYSTEM_REFACTORING"
@@ -1343,8 +1382,9 @@ class ProjectState:
     cognitive_state: Dict[str, Any] = field(default_factory=dict)
     evolutionary_path: List[Dict] = field(default_factory=list)
     # Agile specific state
-    epics: List[str] = field(default_factory=list)
+    epics: List[Dict] = field(default_factory=list)  # Changed to List[Dict] to store epic details
     current_epic: Optional[str] = None
+    current_epic_index: int = 0  # Track which epic we're currently working on
     # Cognitive specific state
     current_strategy: str = "tdd"
     # Agile enhancements
@@ -1489,6 +1529,7 @@ class NeuromorphicMemoryManager:
         embeddings: Optional[Dict[str, List[float]]] = None,
         cognitive_state: Dict = None,
         dev_strategy: str = None,
+        metadata: Dict = None,
     ):
         if "project_blueprints" not in self.collections:
             return
@@ -1496,6 +1537,8 @@ class NeuromorphicMemoryManager:
         try:
             # Store blueprint
             blueprint_doc = f"User Goal: {goal}\n\nBlueprint:\n{blueprint.to_json()}\n\nCognitive State: {json.dumps(cognitive_state) if cognitive_state else 'N/A'}\nStrategy: {dev_strategy}"
+            if metadata:
+                blueprint_doc += f"\n\nMetadata: {json.dumps(metadata)}"
             blueprint_id = f"project_{hash(goal)}_{dev_strategy or 'default'}"
 
             # Add embeddings if provided
@@ -1513,6 +1556,8 @@ class NeuromorphicMemoryManager:
                     f"User Goal: {goal}\n\nSuccessful Strategy:\n"
                     + "\n".join(f"- {s}" for s in strategy)
                 )
+                if metadata:
+                    strategy_doc += f"\n\nMetadata: {json.dumps(metadata)}"
                 strategy_id = f"strategy_{hash(goal)}_{dev_strategy or 'default'}"
 
                 strategy_embedding = (
@@ -1551,13 +1596,17 @@ class NeuromorphicMemoryManager:
                 )
 
             # Add to neuromorphic memory
+            neuromorphic_metadata = {
+                "type": "project",
+                "strategy": strategy,
+                "cognitive_state": cognitive_state,
+            }
+            if metadata:
+                neuromorphic_metadata.update(metadata)
+
             self.neuromorphic_memory.add_memory(
                 {"goal": goal, "blueprint": blueprint.to_json()},
-                {
-                    "type": "project",
-                    "strategy": strategy,
-                    "cognitive_state": cognitive_state,
-                },
+                neuromorphic_metadata,
             )
 
             logger.info(f"Successfully saved neuromorphic memory for goal: '{goal}'")
@@ -1707,8 +1756,9 @@ def is_retryable_api_error(exception: BaseException) -> bool:
 class QuantumCognitiveAI:
     """Advanced AI interaction layer with quantum-inspired cognitive capabilities"""
 
-    def __init__(self, llm_choice: str = "api", api_keys: Dict[str, str] = None):
+    def __init__(self, llm_choice: str = "api", api_keys: Dict[str, str] = None, orchestrator: Optional[Any] = None):
         self.llm_choice = llm_choice
+        self.orchestrator = orchestrator  # Reference to the orchestrator for memory access
         self.api_call_count = 0
         self.last_call_time = 0
         self.rate_limit_lock = asyncio.Lock()
@@ -2621,13 +2671,53 @@ Please repair and return ONLY valid JSON that conforms to the schema. No explana
         target_file = task.get("details", {}).get("target_file")
         file_blueprint = living_blueprint.get_file(target_file)
 
+        # Retrieve relevant code patterns for memory-augmented generation
+        relevant_patterns = []
+        if self.orchestrator and hasattr(self.orchestrator, 'retrieve_relevant_patterns'):
+            relevant_patterns = await self.orchestrator.retrieve_relevant_patterns({
+                "dev_strategy": dev_strategy,
+                "task_type": task.get("task_type"),
+                "file_type": file_blueprint.language
+            })
+
+        # Format patterns for inclusion in prompt
+        patterns_text = ""
+        if relevant_patterns:
+            patterns_text = "\nRELEVANT CODE PATTERNS TO FOLLOW:\n"
+            for i, pattern in enumerate(relevant_patterns, 1):
+                patterns_text += f"""
+Pattern {i}: {pattern.get('pattern_name', 'Unknown')} ({pattern.get('category', 'general')})
+Description: {pattern.get('description', 'No description')}
+Code Example:
+```python
+{pattern.get('code_snippet', 'No code snippet')}
+```
+Applicable in: {', '.join(pattern.get('applicable_contexts', []))}
+Quality Score: {pattern.get('quality_score', 0.0)}
+---
+"""
+            patterns_text += "\nUse these patterns as reference for best practices in your implementation.\n"
+
         prompt = (
-            f"You are an expert programmer. Your task is to write the complete code for the file '{target_file}'.\n"
+            f"You are a senior software engineer and expert programmer. Your task is to write the complete code for the file '{target_file}'.\n"
             f"PROJECT GOAL: {goal}\n"
             f"DEVELOPMENT STRATEGY: {dev_strategy}\n"
             f"CURRENT CODEBASE CONTEXT: {list(current_codebase.keys())}\n"
-            f"FILE BLUEPRINT:\n{json.dumps(file_blueprint, default=lambda o: o.__dict__, indent=2)}\n\n"
-            "Adhere strictly to the blueprint. Implement all classes and methods as described. Ensure the code is robust, well-documented, and production-ready.\n"
+            f"FILE BLUEPRINT:\n{json.dumps(file_blueprint, default=lambda o: o.__dict__, indent=2)}\n"
+            f"{patterns_text}\n"
+            "REQUIREMENTS:\n"
+            "• Write comprehensive, Google-style docstrings for ALL public modules, classes, and functions\n"
+            "• Include detailed Args, Returns, Raises, and Examples sections in docstrings\n"
+            "• Use modern, idiomatic Python patterns (type hints, dataclasses, async/await where appropriate)\n"
+            "• Follow PEP 8 style guidelines strictly\n"
+            "• Use pytest for testing, dependency injection in FastAPI, and modern async patterns\n"
+            "• Ensure code is robust, well-documented, and production-ready\n"
+            "• Keep cyclomatic complexity under 10 per function - refactor into smaller functions if needed\n"
+            "• Use descriptive variable names and add inline comments for complex logic\n"
+            "• Implement proper error handling with custom exceptions and logging\n"
+            "• Add validation using Pydantic models where appropriate\n"
+            "• Reference the provided code patterns as examples of best practices\n\n"
+            "Adhere strictly to the blueprint while following all these coding standards and learning from the provided patterns.\n"
         )
         if feedback:
             prompt += f"PREVIOUS ATTEMPT FAILED. FEEDBACK: {feedback}\nPlease correct the code based on this feedback.\n"
@@ -2640,8 +2730,877 @@ Please repair and return ONLY valid JSON that conforms to the schema. No explana
             cognitive_state=cognitive_state,
             dev_strategy=dev_strategy,
         )
-        # The code cleaning might be less necessary if the prompt is very strict, but it's a good safeguard.
-        return self._clean_code(raw_code, language=file_blueprint.language)
+
+        # Check code complexity using radon (if available)
+        cleaned_code = self._clean_code(raw_code, language=file_blueprint.language)
+
+        # Check cyclomatic complexity
+        if self._check_code_complexity(cleaned_code) > 10:
+            logger.warning(f"Generated code has high complexity (>10). Requesting refactoring...")
+            # Add complexity feedback and retry once
+            complexity_feedback = "The generated code has cyclomatic complexity >10. Please refactor into smaller, more manageable functions while maintaining the same functionality."
+            prompt += f"\n\nCOMPLEXITY FEEDBACK: {complexity_feedback}\n"
+
+            raw_code = await self._make_api_call(
+                prompt,
+                "Code Crafter",
+                cognitive_state=cognitive_state,
+                dev_strategy=dev_strategy,
+            )
+            cleaned_code = self._clean_code(raw_code, language=file_blueprint.language)
+
+            # Final complexity check
+            final_complexity = self._check_code_complexity(cleaned_code)
+            if final_complexity > 10:
+                logger.warning(f"Code still has high complexity ({final_complexity}) after refactoring attempt.")
+
+        return cleaned_code
+
+    async def extract_and_store_code_patterns(
+        self,
+        code: str,
+        file_name: str,
+        goal: str,
+        dev_strategy: str,
+        cognitive_state: Dict = None
+    ) -> None:
+        """Extract architectural and coding patterns from high-quality code and store in memory."""
+        try:
+            # Only extract patterns from successful, high-quality code
+            if not code or len(code.strip()) < 100:
+                return
+
+            # Analyze code structure and patterns
+            patterns = await self._analyze_code_patterns(code, file_name, goal, dev_strategy)
+
+            # Store patterns in neuromorphic memory via orchestrator
+            if patterns and self.orchestrator and hasattr(self.orchestrator, '_store_pattern_in_memory'):
+                for pattern in patterns:
+                    await self.orchestrator._store_pattern_in_memory(pattern, cognitive_state)
+
+                logger.info(f"Extracted and stored {len(patterns)} code patterns from {file_name}")
+
+        except Exception as e:
+            logger.warning(f"Failed to extract code patterns: {e}")
+
+    async def _analyze_code_patterns(self, code: str, file_name: str, goal: str, dev_strategy: str) -> List[Dict]:
+        """Analyze code and extract architectural/coding patterns."""
+        patterns = []
+
+        # Pattern 1: Async/Await Patterns
+        if "async def" in code and "await" in code:
+            patterns.append({
+                "type": "architectural",
+                "category": "async",
+                "name": "Modern Async/Await Patterns",
+                "description": "Clean async/await implementation with proper error handling",
+                "code_snippet": self._extract_async_pattern(code),
+                "applicable_contexts": ["async_operations", "concurrent_processing", "io_bound_tasks"],
+                "quality_score": 0.95
+            })
+
+        # Pattern 2: Exception Handling
+        if "try:" in code and "except" in code:
+            patterns.append({
+                "type": "error_handling",
+                "category": "exception_handling",
+                "name": "Comprehensive Exception Handling",
+                "description": "Robust error handling with specific exception types and logging",
+                "code_snippet": self._extract_exception_pattern(code),
+                "applicable_contexts": ["error_handling", "robustness", "debugging"],
+                "quality_score": 0.90
+            })
+
+        # Pattern 3: Configuration Management
+        if "config" in code.lower() and ("json" in code or "yaml" in code or "env" in code):
+            patterns.append({
+                "type": "configuration",
+                "category": "config_management",
+                "name": "Externalized Configuration",
+                "description": "Proper configuration management with environment variables and files",
+                "code_snippet": self._extract_config_pattern(code),
+                "applicable_contexts": ["configuration", "environment_management", "deployment"],
+                "quality_score": 0.88
+            })
+
+        # Pattern 4: Logging
+        if "logger" in code or "logging" in code:
+            patterns.append({
+                "type": "monitoring",
+                "category": "logging",
+                "name": "Structured Logging",
+                "description": "Comprehensive logging with structured format and context",
+                "code_snippet": self._extract_logging_pattern(code),
+                "applicable_contexts": ["monitoring", "debugging", "observability"],
+                "quality_score": 0.87
+            })
+
+        return patterns
+
+    def _extract_async_pattern(self, code: str) -> str:
+        """Extract async pattern from code."""
+        lines = code.split('\n')
+        pattern_lines = []
+
+        for i, line in enumerate(lines):
+            if 'async def' in line or 'await' in line:
+                pattern_lines.extend(lines[max(0, i-1):min(len(lines), i+5)])
+                break
+
+        return '\n'.join(pattern_lines[:15])
+
+    def _extract_exception_pattern(self, code: str) -> str:
+        """Extract exception handling pattern from code."""
+        lines = code.split('\n')
+        pattern_lines = []
+
+        for i, line in enumerate(lines):
+            if 'try:' in line or 'except' in line:
+                pattern_lines.extend(lines[max(0, i-1):min(len(lines), i+8)])
+                break
+
+        return '\n'.join(pattern_lines[:15])
+
+    def _extract_config_pattern(self, code: str) -> str:
+        """Extract configuration pattern from code."""
+        lines = code.split('\n')
+        pattern_lines = []
+
+        for i, line in enumerate(lines):
+            if 'config' in line.lower() or 'json' in line or 'env' in line:
+                pattern_lines.extend(lines[max(0, i-1):min(len(lines), i+5)])
+                break
+
+        return '\n'.join(pattern_lines[:10])
+
+    def _extract_logging_pattern(self, code: str) -> str:
+        """Extract logging pattern from code."""
+        lines = code.split('\n')
+        pattern_lines = []
+
+        for i, line in enumerate(lines):
+            if 'logger' in line or 'logging' in line:
+                pattern_lines.extend(lines[max(0, i-1):min(len(lines), i+5)])
+                break
+
+        return '\n'.join(pattern_lines[:10])
+
+    async def extract_and_store_code_patterns(
+        self,
+        code: str,
+        file_name: str,
+        goal: str,
+        dev_strategy: str,
+        cognitive_state: Dict = None
+    ) -> None:
+        """Extract architectural and coding patterns from high-quality code and store in memory."""
+        try:
+            # Only extract patterns from successful, high-quality code
+            if not code or len(code.strip()) < 100:
+                return
+
+            # Analyze code structure and patterns
+            patterns = await self._analyze_code_patterns(code, file_name, goal, dev_strategy)
+
+            # Store patterns in neuromorphic memory
+            if patterns:
+                for pattern in patterns:
+                    await self._store_pattern_in_memory(pattern, cognitive_state)
+
+                logger.info(f"Extracted and stored {len(patterns)} code patterns from {file_name}")
+
+        except Exception as e:
+            logger.warning(f"Failed to extract code patterns: {e}")
+
+    async def _analyze_code_patterns(self, code: str, file_name: str, goal: str, dev_strategy: str) -> List[Dict]:
+        """Analyze code and extract architectural/coding patterns."""
+        patterns = []
+
+        # Pattern 1: FastAPI Structure (if applicable)
+        if "fastapi" in code.lower() and "APIRouter" in code:
+            patterns.append({
+                "type": "architectural",
+                "category": "fastapi",
+                "name": "Modern FastAPI Router Structure",
+                "description": "Clean FastAPI router with proper dependency injection and error handling",
+                "code_snippet": self._extract_fastapi_pattern(code),
+                "applicable_contexts": ["web_api", "rest_api", "microservice"],
+                "quality_score": 0.95
+            })
+
+        # Pattern 2: Pydantic Models
+        if "BaseModel" in code and "Field" in code:
+            patterns.append({
+                "type": "data_modeling",
+                "category": "pydantic",
+                "name": "Comprehensive Pydantic Models",
+                "description": "Well-structured Pydantic models with validation and documentation",
+                "code_snippet": self._extract_pydantic_pattern(code),
+                "applicable_contexts": ["data_validation", "api_schemas", "configuration"],
+                "quality_score": 0.90
+            })
+
+        # Pattern 3: SQLAlchemy ORM Usage
+        if "Column" in code and "relationship" in code.lower():
+            patterns.append({
+                "type": "data_access",
+                "category": "sqlalchemy",
+                "name": "Modern SQLAlchemy ORM Patterns",
+                "description": "Proper SQLAlchemy model definitions with relationships and constraints",
+                "code_snippet": self._extract_sqlalchemy_pattern(code),
+                "applicable_contexts": ["database_models", "orm", "data_persistence"],
+                "quality_score": 0.88
+            })
+
+        # Pattern 4: Service Layer Architecture
+        if "Service" in code and "async def" in code:
+            patterns.append({
+                "type": "architectural",
+                "category": "service_layer",
+                "name": "Clean Architecture Service Layer",
+                "description": "Proper separation of concerns with service layer for business logic",
+                "code_snippet": self._extract_service_pattern(code),
+                "applicable_contexts": ["business_logic", "clean_architecture", "dependency_injection"],
+                "quality_score": 0.92
+            })
+
+        # Pattern 5: Comprehensive Testing
+        if "pytest" in code or "@pytest" in code:
+            patterns.append({
+                "type": "testing",
+                "category": "pytest",
+                "name": "Modern Pytest Patterns",
+                "description": "Comprehensive test suite with fixtures, mocking, and async support",
+                "code_snippet": self._extract_pytest_pattern(code),
+                "applicable_contexts": ["unit_testing", "integration_testing", "test_automation"],
+                "quality_score": 0.87
+            })
+
+        return patterns
+
+    def _extract_fastapi_pattern(self, code: str) -> str:
+        """Extract FastAPI pattern from code."""
+        lines = code.split('\n')
+        pattern_lines = []
+
+        for i, line in enumerate(lines):
+            if 'from fastapi import' in line or 'APIRouter' in line or '@router.' in line:
+                pattern_lines.extend(lines[max(0, i-2):min(len(lines), i+5)])
+                break
+
+        return '\n'.join(pattern_lines[:20])  # Limit to 20 lines
+
+    def _extract_pydantic_pattern(self, code: str) -> str:
+        """Extract Pydantic pattern from code."""
+        lines = code.split('\n')
+        pattern_lines = []
+
+        for i, line in enumerate(lines):
+            if 'from pydantic import' in line or 'class.*BaseModel' in line:
+                pattern_lines.extend(lines[max(0, i-1):min(len(lines), i+15)])
+                break
+
+        return '\n'.join(pattern_lines[:25])
+
+    def _extract_sqlalchemy_pattern(self, code: str) -> str:
+        """Extract SQLAlchemy pattern from code."""
+        lines = code.split('\n')
+        pattern_lines = []
+
+        for i, line in enumerate(lines):
+            if 'from sqlalchemy' in line or 'class.*Base' in line or 'Column(' in line:
+                pattern_lines.extend(lines[max(0, i-1):min(len(lines), i+10)])
+                break
+
+        return '\n'.join(pattern_lines[:20])
+
+    def _extract_service_pattern(self, code: str) -> str:
+        """Extract service layer pattern from code."""
+        lines = code.split('\n')
+        pattern_lines = []
+
+        for i, line in enumerate(lines):
+            if 'class.*Service' in line or 'async def' in line and 'service' in line.lower():
+                pattern_lines.extend(lines[max(0, i-2):min(len(lines), i+8)])
+                break
+
+        return '\n'.join(pattern_lines[:15])
+
+    def _extract_pytest_pattern(self, code: str) -> str:
+        """Extract pytest pattern from code."""
+        lines = code.split('\n')
+        pattern_lines = []
+
+        for i, line in enumerate(lines):
+            if 'import pytest' in line or 'def test_' in line or '@pytest' in line:
+                pattern_lines.extend(lines[max(0, i-1):min(len(lines), i+10)])
+                break
+
+        return '\n'.join(pattern_lines[:15])
+
+    async def _store_pattern_in_memory(self, pattern: Dict, cognitive_state: Dict = None) -> None:
+        """Store a code pattern in neuromorphic memory."""
+        try:
+            # Create memory entry
+            memory_data = {
+                "pattern_name": pattern["name"],
+                "pattern_type": pattern["type"],
+                "category": pattern["category"],
+                "description": pattern["description"],
+                "code_snippet": pattern["code_snippet"],
+                "applicable_contexts": pattern["applicable_contexts"],
+                "quality_score": pattern["quality_score"],
+                "timestamp": time.time(),
+                "source_file": "code_pattern_extraction"
+            }
+
+            # Store in neuromorphic memory
+            self.memory.add_memory(
+                memory_data,
+                metadata={
+                    "type": "code_pattern",
+                    "category": pattern["category"],
+                    "quality_score": pattern["quality_score"]
+                },
+                strategy=["code_pattern", "learning"],
+                cognitive_state=cognitive_state,
+                dev_strategy="cognitive"
+            )
+
+            logger.info(f"Stored code pattern: {pattern['name']} (category: {pattern['category']})")
+
+        except Exception as e:
+            logger.warning(f"Failed to store pattern in memory: {e}")
+
+    async def retrieve_relevant_patterns(self, context: Dict, k: int = 3) -> List[Dict]:
+        """Retrieve relevant code patterns based on context."""
+        try:
+            # Create query based on context
+            query_parts = []
+            if context.get("dev_strategy"):
+                query_parts.append(f"development strategy: {context['dev_strategy']}")
+            if context.get("task_type"):
+                query_parts.append(f"task type: {context['task_type']}")
+            if context.get("file_type"):
+                query_parts.append(f"file type: {context['file_type']}")
+
+            query = " ".join(query_parts) if query_parts else "high quality code patterns"
+
+            # Use neuromorphic memory to find similar patterns
+            similar_memories = self.memory.retrieve_similar(query, k=k)
+
+            # Filter for code patterns
+            code_patterns = []
+            for memory in similar_memories:
+                if isinstance(memory, dict) and memory.get("type") == "code_pattern":
+                    code_patterns.append(memory)
+
+            return code_patterns[:k]
+
+        except Exception as e:
+            logger.warning(f"Failed to retrieve patterns: {e}")
+            return []
+
+    async def analyze_codebase_quality(self, codebase: Dict[str, str]) -> Dict[str, Any]:
+        """Analyze the entire codebase using cognitive pattern metrics and identify refactoring opportunities."""
+        try:
+            logger.info("Starting comprehensive codebase quality analysis...")
+
+            quality_report = {
+                "overall_score": 0.0,
+                "total_files": len(codebase),
+                "analysis_date": time.time(),
+                "quality_issues": [],
+                "complexity_hotspots": [],
+                "refactoring_priorities": [],
+                "recommendations": []
+            }
+
+            total_complexity_score = 0.0
+            total_maintainability_score = 0.0
+            file_count = 0
+
+            for file_name, file_content in codebase.items():
+                if not file_content or len(file_content.strip()) < 50:
+                    continue
+
+                try:
+                    # Analyze individual file
+                    file_analysis = await self._analyze_file_quality(file_name, file_content)
+
+                    if file_analysis["complexity_score"] > 0:
+                        file_count += 1
+                        total_complexity_score += file_analysis["complexity_score"]
+                        total_maintainability_score += file_analysis["maintainability_score"]
+
+                        # Identify high complexity hotspots
+                        if file_analysis["complexity_score"] < 0.7:  # Low complexity score
+                            quality_report["complexity_hotspots"].append({
+                                "file": file_name,
+                                "complexity_score": file_analysis["complexity_score"],
+                                "maintainability_score": file_analysis["maintainability_score"],
+                                "issues": file_analysis["issues"]
+                            })
+
+                        # Collect quality issues
+                        if file_analysis["issues"]:
+                            quality_report["quality_issues"].extend(file_analysis["issues"])
+
+                except Exception as e:
+                    logger.warning(f"Failed to analyze file {file_name}: {e}")
+                    continue
+
+            # Calculate overall scores
+            if file_count > 0:
+                quality_report["overall_score"] = (total_complexity_score + total_maintainability_score) / (2 * file_count)
+
+                # Generate refactoring priorities based on analysis
+                quality_report["refactoring_priorities"] = self._prioritize_refactoring_opportunities(
+                    quality_report["complexity_hotspots"],
+                    quality_report["quality_issues"]
+                )
+
+                # Generate specific recommendations
+                quality_report["recommendations"] = self._generate_refactoring_recommendations(
+                    quality_report["refactoring_priorities"]
+                )
+
+            logger.info(f"Codebase quality analysis complete. Overall score: {quality_report['overall_score']:.2f}")
+            return quality_report
+
+        except Exception as e:
+            logger.error(f"Failed to analyze codebase quality: {e}")
+            return {
+                "overall_score": 0.0,
+                "total_files": 0,
+                "analysis_date": time.time(),
+                "quality_issues": [],
+                "complexity_hotspots": [],
+                "refactoring_priorities": [],
+                "recommendations": [f"Analysis failed: {str(e)}"]
+            }
+
+    async def _analyze_file_quality(self, file_name: str, file_content: str) -> Dict[str, Any]:
+        """Analyze quality metrics for a single file."""
+        try:
+            # Check cyclomatic complexity
+            complexity_score = self._calculate_complexity_score(file_content)
+
+            # Check maintainability indicators
+            maintainability_score = self._calculate_maintainability_score(file_content, file_name)
+
+            # Identify specific quality issues
+            issues = self._identify_quality_issues(file_content, file_name)
+
+            return {
+                "complexity_score": complexity_score,
+                "maintainability_score": maintainability_score,
+                "issues": issues
+            }
+
+        except Exception as e:
+            logger.warning(f"Failed to analyze file {file_name}: {e}")
+            return {
+                "complexity_score": 0.0,
+                "maintainability_score": 0.0,
+                "issues": [f"Analysis failed: {str(e)}"]
+            }
+
+    def _calculate_complexity_score(self, code: str) -> float:
+        """Calculate complexity score (0-1, higher is better)."""
+        try:
+            complexity = self._check_code_complexity(code)
+
+            # Convert complexity to score (lower complexity = higher score)
+            if complexity <= 5:
+                return 1.0  # Excellent
+            elif complexity <= 10:
+                return 0.8  # Good
+            elif complexity <= 15:
+                return 0.6  # Moderate
+            elif complexity <= 20:
+                return 0.4  # Concerning
+            else:
+                return 0.2  # High complexity - needs refactoring
+
+        except Exception:
+            return 0.5  # Default moderate score
+
+    def _calculate_maintainability_score(self, code: str, file_name: str) -> float:
+        """Calculate maintainability score based on various factors."""
+        try:
+            score = 1.0
+
+            # Check for comprehensive docstrings
+            if not self._has_comprehensive_docstrings(code):
+                score -= 0.2
+
+            # Check for proper error handling
+            if not self._has_proper_error_handling(code):
+                score -= 0.1
+
+            # Check for type hints
+            if file_name.endswith('.py') and not self._has_type_hints(code):
+                score -= 0.1
+
+            # Check for long functions
+            if self._has_long_functions(code):
+                score -= 0.15
+
+            # Check for proper logging
+            if not self._has_proper_logging(code):
+                score -= 0.05
+
+            return max(0.0, score)  # Ensure non-negative
+
+        except Exception:
+            return 0.5  # Default moderate score
+
+    def _identify_quality_issues(self, code: str, file_name: str) -> List[str]:
+        """Identify specific quality issues in the code."""
+        issues = []
+
+        try:
+            # Check for missing docstrings
+            if not self._has_comprehensive_docstrings(code):
+                issues.append("Missing comprehensive docstrings")
+
+            # Check for long functions
+            if self._has_long_functions(code):
+                issues.append("Functions exceed recommended length (>50 lines)")
+
+            # Check for complex functions
+            complexity = self._check_code_complexity(code)
+            if complexity > 15:
+                issues.append(f"High cyclomatic complexity: {complexity}")
+
+            # Check for missing error handling
+            if not self._has_proper_error_handling(code):
+                issues.append("Missing proper error handling")
+
+            # Check for missing type hints (Python only)
+            if file_name.endswith('.py') and not self._has_type_hints(code):
+                issues.append("Missing type hints")
+
+            # Check for missing logging
+            if not self._has_proper_logging(code):
+                issues.append("Missing proper logging")
+
+        except Exception as e:
+            issues.append(f"Quality analysis error: {str(e)}")
+
+        return issues
+
+    def _has_comprehensive_docstrings(self, code: str) -> bool:
+        """Check if code has comprehensive docstrings."""
+        try:
+            # Look for Google-style or NumPy-style docstrings
+            if '"""' in code and ('Args:' in code or 'Parameters' in code or 'Returns' in code):
+                return True
+            return False
+        except:
+            return False
+
+    def _has_proper_error_handling(self, code: str) -> bool:
+        """Check if code has proper error handling."""
+        try:
+            # Look for try/except blocks or error handling
+            if 'try:' in code and 'except' in code:
+                return True
+            if 'raise' in code and 'Exception' in code:
+                return True
+            return False
+        except:
+            return False
+
+    def _has_type_hints(self, code: str) -> bool:
+        """Check if Python code has type hints."""
+        try:
+            # Look for type annotations
+            if '->' in code or ': str' in code or ': int' in code or ': List' in code:
+                return True
+            return False
+        except:
+            return False
+
+    def _has_long_functions(self, code: str) -> bool:
+        """Check if code has functions longer than recommended."""
+        try:
+            lines = code.split('\n')
+            in_function = False
+            function_lines = 0
+
+            for line in lines:
+                if line.strip().startswith('def '):
+                    in_function = True
+                    function_lines = 0
+                elif in_function and line.strip() and not line.startswith(' ') and not line.startswith('\t'):
+                    in_function = False
+                elif in_function:
+                    function_lines += 1
+                    if function_lines > 50:  # 50 lines is the threshold
+                        return True
+
+            return False
+        except:
+            return False
+
+    def _has_proper_logging(self, code: str) -> bool:
+        """Check if code has proper logging."""
+        try:
+            # Look for logging statements
+            if 'logger.' in code or 'logging.' in code:
+                return True
+            return False
+        except:
+            return False
+
+    def _prioritize_refactoring_opportunities(self, hotspots: List[Dict], issues: List[str]) -> List[Dict]:
+        """Prioritize refactoring opportunities based on impact and urgency."""
+        priorities = []
+
+        # Priority 1: High complexity hotspots
+        for hotspot in hotspots:
+            priorities.append({
+                "priority": "HIGH",
+                "category": "complexity",
+                "file": hotspot["file"],
+                "reason": f"High complexity: {hotspot['complexity_score']:.2f}",
+                "impact": "Performance and maintainability",
+                "suggested_action": "Break down complex functions"
+            })
+
+        # Priority 2: Files with multiple quality issues
+        file_issues = {}
+        for issue in issues:
+            # Extract file name from issue if present
+            file_name = "unknown"
+            if " in " in issue or " for " in issue:
+                # This is a rough heuristic - in practice you'd parse the issue more carefully
+                pass
+            file_issues[file_name] = file_issues.get(file_name, 0) + 1
+
+        for file_name, issue_count in file_issues.items():
+            if issue_count >= 3:
+                priorities.append({
+                    "priority": "HIGH",
+                    "category": "quality",
+                    "file": file_name,
+                    "reason": f"Multiple quality issues: {issue_count}",
+                    "impact": "Code maintainability",
+                    "suggested_action": "Comprehensive quality improvements"
+                })
+
+        return sorted(priorities, key=lambda x: x["priority"])
+
+    def _generate_refactoring_recommendations(self, priorities: List[Dict]) -> List[str]:
+        """Generate specific refactoring recommendations."""
+        recommendations = []
+
+        for priority in priorities:
+            if priority["category"] == "complexity":
+                recommendations.append(
+                    f"Refactor {priority['file']} - {priority['suggested_action']} to improve maintainability"
+                )
+            elif priority["category"] == "quality":
+                recommendations.append(
+                    f"Improve code quality in {priority['file']} - {priority['suggested_action']}"
+                )
+
+        if not recommendations:
+            recommendations.append("No immediate refactoring needed - codebase quality is good")
+
+        return recommendations
+
+    async def _trigger_automated_refactoring(self) -> None:
+        """Trigger automated refactoring analysis and create refactoring tasks."""
+        try:
+            # Get current codebase
+            codebase = self.assembler.get_all_files()
+            if not codebase:
+                logger.info("No codebase available for refactoring analysis")
+                return
+
+            # Analyze codebase quality
+            quality_report = await self.analyze_codebase_quality(codebase)
+
+            logger.info(f"Automated refactoring analysis complete. Overall score: {quality_report['overall_score']:.2f}")
+
+            # Check if refactoring is needed
+            if quality_report['overall_score'] >= 0.8:
+                logger.info("Codebase quality is good. No immediate refactoring needed.")
+                return
+
+            # Create specific refactoring tasks based on priorities
+            priorities = quality_report.get('refactoring_priorities', [])
+            if not priorities:
+                logger.info("No specific refactoring priorities identified")
+                return
+
+            # Take the top priority refactoring opportunity
+            top_priority = priorities[0]
+            logger.info(f"Creating refactoring task for: {top_priority['file']} - {top_priority['reason']}")
+
+            # Create a refactoring task
+            refactoring_task = {
+                "task_type": TaskType.REFACTOR.value,
+                "task_description": f"Refactor {top_priority['file']} - {top_priority['suggested_action']}",
+                "details": {
+                    "target_file": top_priority["file"],
+                    "refactoring_type": top_priority["category"],
+                    "reason": top_priority["reason"],
+                    "impact": top_priority["impact"],
+                    "quality_report": quality_report
+                }
+            }
+
+            # Add to front of task queue (high priority)
+            self.project_state.task_queue.insert(0, refactoring_task)
+
+            logger.info(f"Queued refactoring task: {refactoring_task['task_description']}")
+
+        except Exception as e:
+            logger.warning(f"Failed to trigger automated refactoring: {e}")
+
+    async def _execute_refactoring_task(self, task: Dict, dev_strategy: str) -> Tuple[bool, str]:
+        """Execute a refactoring task to improve code quality."""
+        try:
+            target_file = task.get("details", {}).get("target_file")
+            refactoring_type = task.get("details", {}).get("refactoring_type")
+            reason = task.get("details", {}).get("reason", "Code quality improvement")
+
+            if not target_file:
+                return False, "Refactoring task requires a 'target_file'."
+
+            logger.info(f"Executing refactoring task for {target_file}: {reason}")
+
+            # Get current code
+            current_code = self.assembler.get_file(target_file)
+            if not current_code:
+                return False, f"Target file {target_file} not found in codebase."
+
+            # Generate refactored code
+            refactored_code = await self._generate_refactored_code(
+                current_code,
+                target_file,
+                refactoring_type,
+                reason,
+                dev_strategy
+            )
+
+            if refactored_code:
+                # Apply the refactoring
+                self.assembler.add_file(target_file, refactored_code)
+                self.assembler.write_files_to_disk()
+
+                logger.info(f"Successfully refactored {target_file}")
+                return True, f"Refactored {target_file} for {reason}."
+
+            return False, f"Failed to generate refactored code for {target_file}."
+
+        except Exception as e:
+            logger.error(f"Error executing refactoring task: {e}")
+            return False, f"Refactoring failed: {str(e)}"
+
+    async def _generate_refactored_code(
+        self,
+        current_code: str,
+        file_name: str,
+        refactoring_type: str,
+        reason: str,
+        dev_strategy: str
+    ) -> Optional[str]:
+        """Generate refactored code based on the refactoring type and reason."""
+        try:
+            # Create refactoring prompt based on type
+            if refactoring_type == "complexity":
+                prompt = (
+                    f"You are a senior software engineer specializing in code refactoring. Your task is to refactor the following code to reduce cyclomatic complexity while maintaining the same functionality.\n\n"
+                    f"TARGET FILE: {file_name}\n"
+                    f"REFACTORING REASON: {reason}\n"
+                    f"CURRENT CODE:\n{current_code}\n\n"
+                    "REFACTORING REQUIREMENTS:\n"
+                    "• Break down complex functions into smaller, more manageable functions (keep complexity under 10)\n"
+                    "• Extract common logic into separate helper functions\n"
+                    "• Use early returns to reduce nesting\n"
+                    "• Add clear function names that describe their purpose\n"
+                    "• Maintain all existing functionality\n"
+                    "• Keep the same interface and API\n"
+                    "• Add comprehensive docstrings for new functions\n"
+                    "• Use type hints where appropriate\n\n"
+                    "Provide ONLY the refactored code without markdown fences or explanations."
+                )
+            elif refactoring_type == "quality":
+                prompt = (
+                    f"You are a senior software engineer specializing in code quality improvement. Your task is to improve the code quality while maintaining functionality.\n\n"
+                    f"TARGET FILE: {file_name}\n"
+                    f"REFACTORING REASON: {reason}\n"
+                    f"CURRENT CODE:\n{current_code}\n\n"
+                    "QUALITY IMPROVEMENT REQUIREMENTS:\n"
+                    "• Add comprehensive Google-style docstrings to all public functions and classes\n"
+                    "• Add type hints to function parameters and return types\n"
+                    "• Implement proper error handling with try/catch blocks\n"
+                    "• Add structured logging statements\n"
+                    "• Improve variable names for clarity\n"
+                    "• Break down long functions into smaller, focused functions\n"
+                    "• Add input validation where appropriate\n"
+                    "• Maintain all existing functionality\n"
+                    "• Keep the same interface and API\n\n"
+                    "Provide ONLY the refactored code without markdown fences or explanations."
+                )
+            else:
+                prompt = (
+                    f"You are a senior software engineer. Your task is to refactor the following code to improve its overall quality and maintainability.\n\n"
+                    f"TARGET FILE: {file_name}\n"
+                    f"REFACTORING REASON: {reason}\n"
+                    f"CURRENT CODE:\n{current_code}\n\n"
+                    "GENERAL REFACTORING REQUIREMENTS:\n"
+                    "• Improve code structure and organization\n"
+                    "• Add comprehensive docstrings and type hints\n"
+                    "• Implement proper error handling\n"
+                    "• Add appropriate logging\n"
+                    "• Reduce complexity where possible\n"
+                    "• Maintain all existing functionality\n"
+                    "• Keep the same interface and API\n\n"
+                    "Provide ONLY the refactored code without markdown fences or explanations."
+                )
+
+            # Generate refactored code
+            refactored_code = await self._make_api_call(
+                prompt,
+                "Code Quality Engineer",
+                cognitive_state=self.project_state.cognitive_state,
+                dev_strategy=dev_strategy,
+            )
+
+            return self._clean_code(refactored_code, Path(file_name).suffix[1:])
+
+        except Exception as e:
+            logger.error(f"Error generating refactored code: {e}")
+            return None
+
+    def _check_code_complexity(self, code: str) -> int:
+        """Check the cyclomatic complexity of generated code using radon."""
+        try:
+            # Try to import radon
+            import radon.complexity as radon_complexity
+
+            # Calculate complexity
+            complexity_visitor = radon_complexity.ComplexityVisitor.from_code(code)
+            if complexity_visitor.functions:
+                # Return the maximum complexity found
+                max_complexity = max(func.complexity for func in complexity_visitor.functions)
+                logger.info(f"Code complexity analysis: {len(complexity_visitor.functions)} functions, max complexity: {max_complexity}")
+                return max_complexity
+            else:
+                logger.info("No functions found in code for complexity analysis")
+                return 1  # No functions = minimal complexity
+        except ImportError:
+            logger.warning("Radon not available for complexity analysis. Skipping complexity check.")
+            return 1  # Assume low complexity if we can't check
+        except Exception as e:
+            logger.warning(f"Error during complexity analysis: {e}. Skipping complexity check.")
+            return 1  # Assume low complexity if there's an error
 
     async def code_reviewer(
         self,
@@ -3920,7 +4879,7 @@ class UltraCognitiveForgeOrchestrator:
         threading.current_thread().dev_strategy = dev_strategy  # Set strategy in thread
 
         # Initialize AI with cognitive capabilities
-        self.ai = QuantumCognitiveAI(llm_choice=llm_choice)
+        self.ai = QuantumCognitiveAI(llm_choice=llm_choice, orchestrator=self)
         self.memory = NeuromorphicMemoryManager()
         self.assembler = CognitiveFileAssembler(self.sandbox_dir, agent_filename)
         self.shell = CognitiveShellCommander(self.sandbox_dir)
@@ -3995,10 +4954,10 @@ services:
 volumes:
   db_data:
 """.strip()
-        self.assembler.add_file("docker-compose.yml", compose)
+    self.assembler.add_file("docker-compose.yml", compose)
 
-        # Backend: requirements
-        be_req = """
+    # Backend: requirements
+    be_req = """
 fastapi==0.114.2
 uvicorn[standard]==0.30.6
 sqlalchemy==2.0.34
@@ -4009,9 +4968,9 @@ alembic==1.13.2
 passlib[bcrypt]==1.7.4
 python-jose[cryptography]==3.3.0
 """.strip()
-        self.assembler.add_file(f"{be_root}/requirements.txt", be_req)
+    self.assembler.add_file(f"{be_root}/requirements.txt", be_req)
 
-        be_docker = """
+    be_docker = """
 FROM python:3.11-slim
 WORKDIR /app
 ENV PYTHONUNBUFFERED=1
@@ -4025,18 +4984,18 @@ RUN chmod +x ./start.sh
 EXPOSE 8000
 CMD ["./start.sh"]
 """.strip()
-        self.assembler.add_file(f"{be_root}/Dockerfile", be_docker)
+    self.assembler.add_file(f"{be_root}/Dockerfile", be_docker)
 
-        be_start = """
+    be_start = """
 #!/bin/sh
 set -e
 export PYTHONPATH=/app
 alembic upgrade head || true
 exec uvicorn app.main:app --host 0.0.0.0 --port ${UVICORN_PORT:-8000}
 """.strip()
-        self.assembler.add_file(f"{be_root}/start.sh", be_start)
+    self.assembler.add_file(f"{be_root}/start.sh", be_start)
 
-        be_main = """
+    be_main = """
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -4058,9 +5017,9 @@ def health():
 def root():
     return {"message": "Backend running"}
 """.strip()
-        self.assembler.add_file(f"{be_root}/app/main.py", be_main)
+    self.assembler.add_file(f"{be_root}/app/main.py", be_main)
 
-        be_db = """
+    be_db = """
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, DeclarativeBase
 import os
@@ -4080,9 +5039,32 @@ def get_db():
     finally:
         db.close()
 """.strip()
-        self.assembler.add_file(f"{be_root}/app/db.py", be_db)
+    self.assembler.add_file(f"{be_root}/app/db.py", be_db)
 
-        be_models = """
+def _extract_core_functionality_from_memory(self, text: str) -> Optional[str]:
+    """Extract core functionality from text using memory manager method."""
+    # Since the method exists in the memory manager, we need to access it through self.memory
+    # But the memory manager method is an instance method, so we need to call it properly
+    try:
+        # Try to call the method on the memory manager
+        if hasattr(self.memory, '_extract_core_functionality'):
+            return self.memory._extract_core_functionality(text)
+        else:
+            # Fallback to simple matching if method not available
+            return self._simple_core_extraction(text)
+    except Exception:
+        return self._simple_core_extraction(text)
+
+def _simple_core_extraction(self, text: str) -> str:
+    """Simple fallback core functionality extraction."""
+    # Remove common prefixes and suffixes
+    text = text.replace("implement user story:", "").replace("create and implement:", "")
+    text = text.replace("as a", "").replace("as the", "")
+    text = text.replace("so that", "").replace("to", "")
+    return text.strip()[:50]  # Return first 50 chars as simple extraction
+
+
+be_models = """
 from sqlalchemy import Column, Integer, String, Boolean, Text, ForeignKey, DateTime
 from sqlalchemy.orm import relationship
 from datetime import datetime
@@ -4107,9 +5089,9 @@ class ChangeEvent(Base):
     diff = Column(Text, default="")
     monitor = relationship("Monitor", back_populates="changes")
 """.strip()
-        self.assembler.add_file(f"{be_root}/app/models.py", be_models)
+self.assembler.add_file(f"{be_root}/app/models.py", be_models)
 
-        be_schemas = """
+be_schemas = """
 from pydantic import BaseModel, HttpUrl, Field
 from typing import Optional, List
 from datetime import datetime
@@ -4138,9 +5120,9 @@ class ChangeEventRead(BaseModel):
     class Config:
         from_attributes = True
 """.strip()
-        self.assembler.add_file(f"{be_root}/app/schemas.py", be_schemas)
+self.assembler.add_file(f"{be_root}/app/schemas.py", be_schemas)
 
-        be_router = """
+be_router = """
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from typing import List
@@ -4173,9 +5155,9 @@ def delete_monitor(monitor_id: int, db: Session = Depends(get_db)):
     db.commit()
     return {"ok": True}
 """.strip()
-        self.assembler.add_file(f"{be_root}/app/routers/monitors.py", be_router)
+self.assembler.add_file(f"{be_root}/app/routers/monitors.py", be_router)
 
-        be_main2 = """
+be_main2 = """
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from .routers.monitors import router as monitors_router
@@ -4196,10 +5178,10 @@ def health():
 
 app.include_router(monitors_router)
 """.strip()
-        self.assembler.add_file(f"{be_root}/app/main.py", be_main2)
+self.assembler.add_file(f"{be_root}/app/main.py", be_main2)
 
         # Auth models, schemas, router
-        be_auth_models = """
+be_auth_models = """
 from sqlalchemy import Column, Integer, String, DateTime, UniqueConstraint
 from datetime import datetime
 from .db import Base
@@ -4212,9 +5194,9 @@ class User(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     __table_args__ = (UniqueConstraint('email', name='uq_users_email'),)
 """.strip()
-        self.assembler.add_file(f"{be_root}/app/auth_models.py", be_auth_models)
+self.assembler.add_file(f"{be_root}/app/auth_models.py", be_auth_models)
 
-        be_auth_schemas = """
+be_auth_schemas = """
 from pydantic import BaseModel, EmailStr
 
 class UserCreate(BaseModel):
@@ -4225,9 +5207,9 @@ class Token(BaseModel):
     access_token: str
     token_type: str = 'bearer'
 """.strip()
-        self.assembler.add_file(f"{be_root}/app/auth_schemas.py", be_auth_schemas)
+self.assembler.add_file(f"{be_root}/app/auth_schemas.py", be_auth_schemas)
 
-        be_auth = """
+be_auth = """
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from passlib.context import CryptContext
@@ -4275,9 +5257,9 @@ def login(payload: UserCreate, db: Session = Depends(get_db)):
         raise HTTPException(status_code=401, detail='Invalid credentials')
     return Token(access_token=create_token(u.id, u.email))
 """.strip()
-        self.assembler.add_file(f"{be_root}/app/routers/auth.py", be_auth)
+self.assembler.add_file(f"{be_root}/app/routers/auth.py", be_auth)
 
-        be_main3 = """
+be_main3 = """
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from .routers.monitors import router as monitors_router
@@ -4300,10 +5282,10 @@ def health():
 app.include_router(auth_router)
 app.include_router(monitors_router)
 """.strip()
-        self.assembler.add_file(f"{be_root}/app/main.py", be_main3)
+self.assembler.add_file(f"{be_root}/app/main.py", be_main3)
 
         # Alembic setup
-        alembic_ini = """
+alembic_ini = """
 [alembic]
 script_location = alembic
 sqlalchemy.url = %(DATABASE_URL)s
@@ -4340,9 +5322,9 @@ formatter = generic
 [formatter_generic]
 format = %(levelname)-5.5s [%(name)s] %(message)s
 """.strip()
-        self.assembler.add_file(f"{be_root}/alembic.ini", alembic_ini)
+self.assembler.add_file(f"{be_root}/alembic.ini", alembic_ini)
 
-        alembic_env = """
+alembic_env = """
 from logging.config import fileConfig
 from sqlalchemy import engine_from_config
 from sqlalchemy import pool
@@ -4381,7 +5363,7 @@ if context.is_offline_mode():
 else:
     run_migrations_online()
 """.strip()
-        self.assembler.add_file(f"{be_root}/alembic/env.py", alembic_env)
+self.assembler.add_file(f"{be_root}/alembic/env.py", alembic_env)
 
         alembic_ver = """
 """.strip()
@@ -4789,7 +5771,19 @@ Backend: http://localhost:8000/health
             last_task_result = None
             sprint_count = 0  # For Agile
 
+            # Maximum task execution limit to prevent infinite loops
+            max_tasks = getattr(config, "max_tasks_per_run", 100)
+            # Sprint tracking for Agile
+            sprint_task_count = 0
+            sprint_duration = config.strategy_configs[DevelopmentStrategy.AGILE.value].get("sprint_duration", 14)
+            sprint_batch_size = config.strategy_configs[DevelopmentStrategy.AGILE.value].get("sprint_batch_size", 5)
+
             while not goal_achieved:
+                # Prevent infinite loops - emergency brake
+                if len(self.project_state.completed_tasks) >= max_tasks:
+                    logger.warning(f"Maximum task limit ({max_tasks}) reached. Stopping to prevent infinite loop.")
+                    break
+
                 # Cognitive health check
                 if not self._check_cognitive_health():
                     logger.warning(
@@ -4798,32 +5792,72 @@ Backend: http://localhost:8000/health
                     await self._adjust_cognitive_state()
                     continue
 
-                # Strategy-specific loops
-                if (
-                    self.project_state.development_strategy
-                    == DevelopmentStrategy.AGILE.value
-                    and sprint_count > 0
-                    and sprint_count
-                    % config.strategy_configs[DevelopmentStrategy.AGILE.value][
-                        "sprint_duration"
-                    ]
-                    == 0
-                ):
-                    await self.execute_sprint_review()
+                # Agile-specific sprint management
+                if self.project_state.development_strategy == DevelopmentStrategy.AGILE.value:
+                    sprint_task_count += 1
+
+                    # Execute sprint review every sprint_duration tasks (not days)
+                    if sprint_task_count >= sprint_duration:
+                        logger.info(f"Completing sprint after {sprint_task_count} tasks. Executing sprint review...")
+                        await self.execute_sprint_review()
+                        sprint_task_count = 0  # Reset sprint counter
+
+                        # Update sprint velocity
+                        completed_this_sprint = len([t for t in self.project_state.completed_tasks[-sprint_duration:]])
+                        logger.info(f"Sprint velocity: {completed_this_sprint} tasks completed in this sprint")
+
+                    # Update current epic if we're in Agile mode
+                    if self.project_state.epics:
+                        current_epic_idx = getattr(self.project_state, 'current_epic_index', 0)
+                        if current_epic_idx < len(self.project_state.epics):
+                            self.project_state.current_epic = self.project_state.epics[current_epic_idx].get('description', 'Unknown Epic')
+                        else:
+                            self.project_state.current_epic = "All epics completed"
 
                 # Get next task with cognitive optimization
                 task_response = await self.get_next_task(last_task_result)
                 if not task_response or not task_response.get("task_type"):
                     logger.info("No more tasks to execute. Checking goal achievement.")
-                    goal_achieved = await self.check_goal_achievement(last_task_result)
-                    if goal_achieved:
-                        logger.info("Goal has been achieved!")
-                        break
-                    else:
-                        logger.warning(
-                            "Goal not achieved, but no new tasks were generated. Ending run."
-                        )
-                        break
+
+                    # Check for empty sprint backlog and attempt to refill
+                    if (self.project_state.development_strategy == DevelopmentStrategy.AGILE.value
+                        and not self.project_state.sprint_backlog
+                        and self.project_state.epics):
+                        logger.info("Sprint backlog empty but epics available - attempting to generate more user stories")
+
+                        # Try to refine the current epic
+                        current_epic_idx = getattr(self.project_state, 'current_epic_index', 0)
+                        if current_epic_idx < len(self.project_state.epics):
+                            current_epic = self.project_state.epics[current_epic_idx].get("description")
+                            logger.info(f"Attempting to refine epic: {current_epic[:50]}...")
+
+                            stories = await self._refine_user_stories(current_epic)
+                            if stories:
+                                self.project_state.user_stories.extend(stories)
+                                # Add to sprint backlog
+                                sprint_backlog_size = config.strategy_configs[DevelopmentStrategy.AGILE.value].get("sprint_batch_size", 5)
+                                stories_sorted = sorted(stories, key=lambda x: x.get('story_points', 1))
+                                new_sprint_items = stories_sorted[:sprint_backlog_size]
+
+                                current_time = time.time()
+                                for story in new_sprint_items:
+                                    story['added_at'] = current_time
+                                self.project_state.sprint_backlog.extend(new_sprint_items)
+
+                                logger.info(f"Added {len(new_sprint_items)} new stories to sprint backlog")
+                                # Try to get a task again
+                                task_response = await self.get_next_task(last_task_result)
+
+                    if not task_response or not task_response.get("task_type"):
+                        goal_achieved = await self.check_goal_achievement(last_task_result)
+                        if goal_achieved:
+                            logger.info("Goal has been achieved!")
+                            break
+                        else:
+                            logger.warning(
+                                "Goal not achieved, but no new tasks were generated. Ending run."
+                            )
+                            break
 
                 # Execute task with cognitive capabilities
                 success, last_task_result = await self.execute_task(
@@ -4837,10 +5871,83 @@ Backend: http://localhost:8000/health
                     logger.info(
                         f"Task completed successfully. Total completed: {len(self.project_state.completed_tasks)}"
                     )
+
+                    # For agile strategy, remove completed stories from sprint backlog
+                    if self.project_state.development_strategy == DevelopmentStrategy.AGILE.value:
+                        task_desc = task_response.get("task_description", "")
+                        logger.info(f"Task completed: {task_desc}")
+
+                        # Skip removal for "diversify focus" tasks as they are not real user stories
+                        if "Diversify focus:" in task_desc:
+                            logger.info("Skipping sprint backlog cleanup for diversify task (not a real user story)")
+                        else:
+                            # Remove the corresponding story from sprint backlog using better matching
+                            stories_removed = 0
+                            task_lower = task_desc.lower()
+                            for i, story in enumerate(self.project_state.sprint_backlog[:]):  # Create copy to avoid modification during iteration
+                                story_desc = story.get("description", "")
+                                story_lower = story_desc.lower()
+
+                                # Better matching: check if the core functionality matches
+                                # Look for key phrases that indicate the same user story
+                                task_core = self._extract_core_functionality_from_memory(task_lower)
+                                story_core = self._extract_core_functionality_from_memory(story_lower)
+
+                                if task_core and story_core and (task_core in story_core or story_core in task_core):
+                                    self.project_state.sprint_backlog.pop(i)
+                                    logger.info(f"Removed completed story from sprint backlog: {story_desc}")
+                                    stories_removed += 1
+                                    break  # Only remove one story per task
+
+                            if stories_removed == 0:
+                                logger.warning(f"No matching story found in sprint backlog for task: {task_desc}")
+                                logger.info(f"Sprint backlog contains: {[s.get('description', 'No desc')[:50] for s in self.project_state.sprint_backlog[:3]]}...")
+
+                        logger.info(f"Sprint backlog now has {len(self.project_state.sprint_backlog)} items")
+
+                        # Check if sprint backlog is getting too large due to failed tasks
+                        if len(self.project_state.sprint_backlog) > 20:
+                            logger.warning(f"Sprint backlog has {len(self.project_state.sprint_backlog)} items - cleaning up old/failed stories")
+                            # Remove stories that have been in backlog too long
+                            current_time = time.time()
+                            self.project_state.sprint_backlog = [
+                                story for story in self.project_state.sprint_backlog
+                                if story.get('added_at', current_time) > current_time - 3600  # Keep only last hour
+                            ]
+                            logger.info(f"Sprint backlog cleaned up to {len(self.project_state.sprint_backlog)} items")
+
                     self._update_cognitive_state(success=True)
                 else:
                     logger.warning("Task failed. Will attempt to recover.")
                     await self.handle_task_failure(task_response, last_task_result)
+
+                    # For agile strategy, handle failed tasks by removing problematic stories
+                    if self.project_state.development_strategy == DevelopmentStrategy.AGILE.value:
+                        task_desc = task_response.get("task_description", "")
+                        logger.info(f"Handling failed task: {task_desc}")
+
+                        # Remove failed stories from sprint backlog to prevent repeated failures
+                        failed_stories_removed = 0
+                        for i, story in enumerate(self.project_state.sprint_backlog[:]):  # Create copy to avoid modification during iteration
+                            story_desc = story.get("description", "")
+                            if story_desc in task_desc or task_desc in story_desc:
+                                self.project_state.sprint_backlog.pop(i)
+                                logger.info(f"Removed failed story from sprint backlog: {story_desc}")
+                                failed_stories_removed += 1
+
+                        if failed_stories_removed > 0:
+                            logger.info(f"Removed {failed_stories_removed} failed stories from sprint backlog")
+                        else:
+                            logger.warning(f"No matching story found for failed task: {task_desc}")
+
+                        # Check if we're getting too many failures and need to adjust approach
+                        recent_tasks = self.project_state.completed_tasks[-10:]
+                        failures = [t for t in recent_tasks if "failed" in t.lower() or "failure" in t.lower()]
+                        if len(failures) >= 3:
+                            logger.warning("Multiple recent failures detected - may need to adjust approach")
+                            # Force a sprint review to reassess
+                            await self.execute_sprint_review()
+
                     self._update_cognitive_state(success=False)
 
                 await self.save_state()
@@ -5193,47 +6300,133 @@ Backend: http://localhost:8000/health
         # Strategy-aware next task selection
         # Agile: pull next user story from sprint backlog and convert into a concrete dev task
         if self.project_state.development_strategy == DevelopmentStrategy.AGILE.value:
+            # Initialize to_enqueue to empty list to avoid scope issues
+            to_enqueue = []
+
             # Prevent infinite churn on the same file: count last N tasks by target_file
-            main_edits = self.project_state.file_activity_counts.get("main.py", 0)
-            if main_edits >= getattr(config, "max_same_file_tasks", 2):
-                # Force a different file if available in blueprint
-                alt = None
-                for f in self.project_state.living_blueprint.root:
-                    if f.filename != "main.py" and f.filename.endswith(".py"):
-                        alt = f.filename
-                        break
-                if alt:
+            # Check all files that have been worked on recently
+            overworked_files = []
+            max_same_file_tasks = getattr(config, "max_same_file_tasks", 2)
+
+            for filename, edit_count in self.project_state.file_activity_counts.items():
+                if edit_count >= max_same_file_tasks:
+                    overworked_files.append(filename)
+
+            # If any file is overworked, try to find an alternative
+            if overworked_files:
+                primary_overworked = overworked_files[0]  # Take the first overworked file
+                logger.info(f"File {primary_overworked} has been edited {self.project_state.file_activity_counts[primary_overworked]} times, looking for alternative...")
+
+                # Find available Python files that are NOT the overworked one
+                available_files = [
+                    f.filename for f in self.project_state.living_blueprint.root
+                    if f.filename.endswith(".py") and f.filename != primary_overworked
+                ]
+
+                if available_files:
+                    alt = available_files[0]  # Pick the first available alternative
+                    logger.info(f"Diversifying from {primary_overworked} to {alt}")
+                    # Reset the counter for the overworked file to prevent immediate re-diversification
+                    self.project_state.file_activity_counts[primary_overworked] = 0
+                    logger.info(f"Reset edit count for {primary_overworked} after diversification")
+
                     return {
                         "task_type": TaskType.TDD_IMPLEMENTATION.value,
                         "task_description": f"Diversify focus: implement story part in {alt}",
                         "details": {"target_file": alt, "acceptance_criteria": []},
                     }
+                else:
+                    # No alternative files available, reset the counter and continue
+                    logger.warning(f"No alternative files available. Available files: {[f.filename for f in self.project_state.living_blueprint.root]}")
+                    logger.info(f"Resetting edit count for {primary_overworked} to prevent infinite loop")
+                    self.project_state.file_activity_counts[primary_overworked] = 0
+
+                    # Also check if we just completed a diversify task for this same file
+                    # This prevents immediate re-generation of the same diversify task
+                    recent_tasks = self.project_state.completed_tasks[-3:]  # Check last 3 tasks
+                    for recent_task in recent_tasks:
+                        if f"Diversify focus: implement story part in {primary_overworked}" in recent_task:
+                            logger.warning(f"Just completed diversify task for {primary_overworked}, but no alternatives available. This might cause issues.")
+                            logger.info("Skipping further diversification attempts to prevent infinite loop")
+                            # Don't return anything here - let the function continue to generate regular tasks
+                            break
+
             # If no queued tasks and sprint backlog exists, pre-enqueue a batch of tasks
             if self.project_state.sprint_backlog and not self.project_state.task_queue:
+                # Use the sprint_batch_size from the main loop for consistency
                 batch_size = config.strategy_configs[DevelopmentStrategy.AGILE.value].get(
-                    "sprint_batch_size", 3
+                    "sprint_batch_size", 5
                 )
                 to_enqueue = self.project_state.sprint_backlog[:batch_size]
                 self.project_state.sprint_backlog = self.project_state.sprint_backlog[batch_size:]
 
+                logger.info(f"Enqueuing {len(to_enqueue)} tasks from sprint backlog. Remaining: {len(self.project_state.sprint_backlog)}")
+
+            # If no tasks were enqueued (empty sprint backlog), skip to CEO Strategist
+            if not to_enqueue:
+                logger.warning("Sprint backlog is empty or all stories filtered out - no tasks to enqueue")
+                # Don't continue with task generation - let it fall through to CEO Strategist
+                return None
+            else:
                 candidate_files = [
                     f.filename for f in self.project_state.living_blueprint.root if f.filename.endswith(".py")
                 ]
                 if not candidate_files:
-                    candidate_files = ["src/agent.py"]
+                    candidate_files = ["main.py"]  # Fallback to main.py if no Python files exist
 
+                # Ensure we have at least one candidate file
+                if not candidate_files:
+                    logger.error("No candidate files available for task assignment")
+                    return None
+
+                # Filter out tasks that are likely to fail due to missing dependencies or paths
+                valid_stories = []
                 for story in to_enqueue:
+                    story_desc = story.get('description', '').lower()
+                    # Skip tasks that require non-existent file paths
+                    if any(path in story_desc for path in ['apps/backend', 'alembic', 'fastapi', 'sqlalchemy']):
+                        logger.warning(f"Skipping potentially problematic story: {story_desc[:50]}...")
+                        continue
+                    valid_stories.append(story)
+
+                if not valid_stories:
+                    logger.warning("All stories filtered out due to potential issues - consulting CEO Strategist")
+                    # Reset to_enqueue to empty since no valid stories
+                    to_enqueue = []
+                    return None
+
+                for story in valid_stories:
                     # Round-robin file assignment to spread work and avoid churn
+                    # Ensure file_rotation_idx is valid and doesn't exceed list bounds
+                    if self.project_state.file_rotation_idx >= len(candidate_files):
+                        self.project_state.file_rotation_idx = 0
+
                     idx = self.project_state.file_rotation_idx % len(candidate_files)
                     target_file = candidate_files[idx]
                     self.project_state.file_rotation_idx += 1
+
+                    # Check if this task was recently completed to avoid duplicates
+                    story_desc = story.get('description', 'Story')
+                    task_desc = f"Implement user story: {story_desc} in {target_file}"
+                    recent_tasks = self.project_state.completed_tasks[-10:]  # Check last 10 tasks
+
+                    if any(task_desc in recent_task or recent_task in task_desc for recent_task in recent_tasks):
+                        logger.info(f"Skipping duplicate task: {task_desc}")
+                        continue
+
+                    # Also check for recently completed diversify tasks to avoid immediate re-diversification
+                    diversify_task_desc = f"Diversify focus: implement story part in {target_file}"
+                    if any(diversify_task_desc in recent_task for recent_task in recent_tasks):
+                        logger.info(f"Skipping task - recently completed diversify task for {target_file}: {task_desc}")
+                        continue
+
                     # Prioritize tasks that create missing files (breadth-first)
                     if target_file not in self.assembler.get_all_files():
                         self.project_state.task_queue.insert(
                             0,
                             {
                                 "task_type": TaskType.TDD_IMPLEMENTATION.value,
-                                "task_description": f"Create and implement: {story.get('description', 'Story')} in {target_file}",
+                                "task_description": f"Create and implement: {story_desc} in {target_file}",
                                 "details": {
                                     "target_file": target_file,
                                     "acceptance_criteria": story.get("acceptance_criteria", []),
@@ -5245,7 +6438,7 @@ Backend: http://localhost:8000/health
                     self.project_state.task_queue.append(
                         {
                             "task_type": TaskType.TDD_IMPLEMENTATION.value,
-                            "task_description": f"Implement user story: {story.get('description', 'Story')} in {target_file}",
+                            "task_description": task_desc,
                             "details": {
                                 "target_file": target_file,
                                 "acceptance_criteria": story.get("acceptance_criteria", []),
@@ -5259,20 +6452,30 @@ Backend: http://localhost:8000/health
 
             if self.project_state.sprint_backlog:
                 story = self.project_state.sprint_backlog.pop(0)
+                logger.info(f"Processing story from sprint backlog: {story.get('description', 'Unknown')[:50]}...")
+
                 # Heuristic: pick a sensible target file from blueprint
-                candidate_files = [f.filename for f in self.project_state.living_blueprint.root]
-                target_file = None
-                for fname in candidate_files:
-                    if fname.endswith(".py") and not fname.startswith("tests/"):
-                        target_file = fname
-                        break
-                if not target_file:
-                    target_file = candidate_files[0] if candidate_files else "src/agent.py"
+                candidate_files = [f.filename for f in self.project_state.living_blueprint.root if f.filename.endswith(".py")]
+                if not candidate_files:
+                    candidate_files = ["src/agent.py"]
+
+                # Use round-robin assignment to distribute work
+                target_file = candidate_files[self.project_state.file_rotation_idx % len(candidate_files)]
+                self.project_state.file_rotation_idx += 1
+
+                # Check if this story was recently completed to avoid duplicates
+                story_desc = story.get('description', 'Story')
+                task_desc = f"Implement user story: {story_desc} in {target_file}"
+                recent_tasks = self.project_state.completed_tasks[-5:]
+
+                if any(story_desc in recent_task for recent_task in recent_tasks):
+                    logger.info(f"Story recently completed, skipping: {story_desc[:50]}...")
+                    return None  # This will trigger CEO Strategist consultation
 
                 return {
                     # Prefer TDD for new story implementation to ensure tests
                     "task_type": TaskType.TDD_IMPLEMENTATION.value,
-                    "task_description": f"Implement user story: {story.get('description', 'Story')} in {target_file}",
+                    "task_description": task_desc,
                     "details": {
                         "target_file": target_file,
                         "acceptance_criteria": story.get("acceptance_criteria", []),
@@ -5282,36 +6485,159 @@ Backend: http://localhost:8000/health
 
         # If queue is empty, ask CEO for the next task
         logger.info("Task queue is empty. Consulting CEO Strategist...")
+
+        # Check if we've been consulting CEO Strategist too many times recently (potential loop)
+        recent_tasks = self.project_state.completed_tasks[-5:]
+        ceo_consultations = [task for task in recent_tasks if "CEO Strategist" in task or "consulting CEO" in task.lower()]
+
+        if len(ceo_consultations) >= 3:
+            logger.warning("Consulted CEO Strategist 3+ times recently - this might indicate a loop. Checking goal achievement.")
+            # Force a goal achievement check
+            goal_achieved = await self.check_goal_achievement(None)
+            if goal_achieved:
+                logger.info("Goal appears to be achieved despite empty task queue.")
+                return None
+            else:
+                logger.warning("Goal not achieved but no tasks available. This might be a planning issue.")
+
+                # Try to generate a simple fallback task
+                logger.info("Attempting to generate fallback task...")
+                available_files = [f.filename for f in self.project_state.living_blueprint.root if f.filename.endswith(".py")]
+                if not available_files:
+                    available_files = ["main.py"]
+
+                fallback_task = {
+                    "task_type": TaskType.TDD_IMPLEMENTATION.value,
+                    "task_description": f"Create basic implementation for {self.project_state.goal[:50]}...",
+                    "details": {
+                        "target_file": available_files[0],
+                        "acceptance_criteria": ["Basic functionality implemented"],
+                        "story_points": 1,
+                    },
+                }
+
+                logger.info(f"Generated fallback task: {fallback_task['task_description']}")
+                return fallback_task
+
         query_text_for_ceo = (
             json.dumps(self.project_state.goal)
             if isinstance(self.project_state.goal, dict)
             else self.project_state.goal
         )
-        next_task = await self.ai.ceo_strategist(
-            query_text_for_ceo,
-            self.project_state.completed_tasks,
-            self.assembler.get_all_files(),
-            self.project_state,
-            last_task_result,
-            cognitive_state=self.project_state.cognitive_state,
-            dev_strategy=self.project_state.development_strategy,
-        )
-        return next_task
+        try:
+            next_task = await self.ai.ceo_strategist(
+                query_text_for_ceo,
+                self.project_state.completed_tasks,
+                self.assembler.get_all_files(),
+                self.project_state,
+                last_task_result,
+                cognitive_state=self.project_state.cognitive_state,
+                dev_strategy=self.project_state.development_strategy,
+            )
+
+            # Validate the returned task
+            if next_task and isinstance(next_task, dict) and next_task.get("task_type"):
+                logger.info(f"CEO Strategist generated task: {next_task.get('task_description', 'Unknown')}")
+                return next_task
+            else:
+                logger.warning("CEO Strategist returned invalid task. Generating fallback task.")
+                # Return the fallback task we prepared earlier
+                return fallback_task if 'fallback_task' in locals() else None
+
+        except Exception as e:
+            logger.error(f"Error consulting CEO Strategist: {e}")
+            # Return a simple fallback task
+            available_files = [f.filename for f in self.project_state.living_blueprint.root if f.filename.endswith(".py")]
+            if not available_files:
+                available_files = ["main.py"]
+
+            return {
+                "task_type": TaskType.TDD_IMPLEMENTATION.value,
+                "task_description": f"Implement core functionality for {self.project_state.goal[:50]}...",
+                "details": {
+                    "target_file": available_files[0],
+                    "acceptance_criteria": ["Core functionality implemented"],
+                    "story_points": 1,
+                },
+            }
 
     async def check_goal_achievement(self, last_task_result: str) -> bool:
         """Check if the goal has been achieved based on completed tasks and results"""
+        logger.info("Checking goal achievement...")
+
+        # Check for explicit completion indicators
         if last_task_result and (
             "final" in last_task_result.lower()
             or "complete" in last_task_result.lower()
+            or "finished" in last_task_result.lower()
+            or "done" in last_task_result.lower()
         ):
+            logger.info("Goal achieved - explicit completion indicator found")
             return True
 
+        # Check for Agile-specific completion
+        if self.project_state.development_strategy == DevelopmentStrategy.AGILE.value:
+            # In Agile, check if we've completed all epics and stories
+            total_epics = len(self.project_state.epics) if self.project_state.epics else 0
+            completed_epics = getattr(self.project_state, 'current_epic_index', 0)
+
+            if total_epics > 0 and completed_epics >= total_epics:
+                logger.info(f"Goal achieved - all {total_epics} epics completed")
+                return True
+
+            # Check if we've completed a significant number of tasks
+            completed_count = len(self.project_state.completed_tasks)
+            if completed_count >= 15:
+                # Check if sprint backlog is empty (no more work to do)
+                if not self.project_state.sprint_backlog:
+                    logger.info("Goal achieved - significant progress made and no remaining sprint backlog")
+                    return True
+
+                # Check if we're stuck in a loop (same stories being generated repeatedly)
+                if completed_count >= 25:  # Allow more tasks for complex projects
+                    logger.info(f"Goal achieved - completed {completed_count} tasks with remaining backlog. Likely complete.")
+                    return True
+
+        # Check for general completion criteria
         if (
             self.assembler.check_project_size_limits()
             and len(self.project_state.completed_tasks) > 5
         ):
+            logger.info("Goal achieved - project size limits reached with sufficient tasks completed")
             return True
 
+        # Check for substantial progress
+        if len(self.project_state.completed_tasks) >= 10:
+            # Generate a goal achievement assessment
+            assessment_prompt = f"""
+            Assess if the following goal has been achieved:
+
+            Goal: {self.project_state.goal}
+
+            Completed tasks: {len(self.project_state.completed_tasks)}
+            Task descriptions: {self.project_state.completed_tasks[-10:]}  # Last 10 tasks
+
+            Project files created: {len(self.assembler.get_all_files())}
+
+            Based on the completed work, has the goal been substantially achieved?
+            Answer with YES or NO, followed by a brief explanation.
+            """
+
+            try:
+                assessment = await self.ai._make_api_call(
+                    assessment_prompt,
+                    "GoalAssessment",
+                    is_json=False,
+                    cognitive_state=self.project_state.cognitive_state,
+                )
+
+                if "YES" in assessment.upper()[:50]:  # Check first 50 characters
+                    logger.info(f"Goal achieved based on AI assessment: {assessment[:100]}...")
+                    return True
+            except Exception as e:
+                logger.warning(f"Could not assess goal achievement: {e}")
+
+        logger.info(f"Goal not yet achieved. Tasks completed: {len(self.project_state.completed_tasks)}")
         return False
 
     async def save_state(self):
@@ -5469,6 +6795,7 @@ Backend: http://localhost:8000/health
             elif task_type in [
                 TaskType.TDD_IMPLEMENTATION.value,
                 TaskType.CODE_MODIFICATION.value,
+                TaskType.REFACTOR.value,
                 TaskType.CREATE_DOCKERFILE.value,
                 TaskType.SETUP_CI_PIPELINE.value,
             ]:
@@ -5517,18 +6844,52 @@ Backend: http://localhost:8000/health
                     if isinstance(self.project_state.goal, dict)
                     else self.project_state.goal
                 )
-                self.project_state.epics = await self.ai.epic_planner(
+
+                # Get epic planning results
+                epic_results = await self.ai.epic_planner(
                     query_text,
                     [],
                     self.project_state.cognitive_state,
                     self.project_state.development_strategy,
                 )
-                return True, "Epics planned successfully."
+
+                # Convert epics to dictionary format with additional metadata
+                if isinstance(epic_results, list):
+                    self.project_state.epics = []
+                    for i, epic in enumerate(epic_results):
+                        if isinstance(epic, dict):
+                            epic_dict = {
+                                "id": f"epic_{i}",
+                                "description": epic.get("description", str(epic)),
+                                "story_points": epic.get("story_points", 20),
+                                "status": "planned",
+                                "created_at": time.time()
+                            }
+                            self.project_state.epics.append(epic_dict)
+                        else:
+                            # Handle string epics
+                            epic_dict = {
+                                "id": f"epic_{i}",
+                                "description": str(epic),
+                                "story_points": 20,
+                                "status": "planned",
+                                "created_at": time.time()
+                            }
+                            self.project_state.epics.append(epic_dict)
+
+                # Set current epic
+                if self.project_state.epics:
+                    self.project_state.current_epic = self.project_state.epics[0].get("description")
+                    self.project_state.current_epic_index = 0
+                    logger.info(f"Planned {len(self.project_state.epics)} epics. Starting with: {self.project_state.current_epic[:50]}...")
+                    return True, f"Planned {len(self.project_state.epics)} epics successfully."
+                else:
+                    return False, "No epics were generated."
             else:
                 logger.info(
-                    "Epics have already been planned. Skipping PLAN_EPICS task."
+                    f"Epics already planned ({len(self.project_state.epics)} epics). Skipping PLAN_EPICS task."
                 )
-                return True, "Epics already planned."
+                return True, f"Epics already planned ({len(self.project_state.epics)} epics)."
 
         if task_type == TaskType.USER_STORY_REFINEMENT.value:
             epic_to_refine = task["details"].get("epic")
@@ -5537,9 +6898,16 @@ Backend: http://localhost:8000/health
                     "USER_STORY_REFINEMENT task is missing an 'epic' in details. Inferring from project state."
                 )
                 if self.project_state.epics:
-                    # Infer the first epic as the one to work on.
-                    epic_to_refine = self.project_state.epics[0].get("description")
-                    logger.info(f"Inferred epic to refine: '{epic_to_refine[:50]}...'")
+                    # Use current epic index to determine which epic to work on
+                    current_epic_idx = getattr(self.project_state, 'current_epic_index', 0)
+                    if current_epic_idx < len(self.project_state.epics):
+                        epic_to_refine = self.project_state.epics[current_epic_idx].get("description")
+                        logger.info(f"Refining epic {current_epic_idx + 1}/{len(self.project_state.epics)}: '{epic_to_refine[:50]}...'")
+                    else:
+                        # All epics completed, refine the last one or create a new batch
+                        if self.project_state.epics:
+                            epic_to_refine = self.project_state.epics[-1].get("description")
+                            logger.info(f"All epics completed, re-refining last epic: '{epic_to_refine[:50]}...'")
                 else:
                     return (
                         False,
@@ -5553,9 +6921,49 @@ Backend: http://localhost:8000/health
                 )
 
             stories = await self._refine_user_stories(epic_to_refine)
-            self.project_state.user_stories.extend(stories)
-            self.project_state.sprint_backlog = stories[:5]  # Top 5 for sprint
-            return True, f"Refined {len(stories)} user stories."
+
+            if stories:
+                self.project_state.user_stories.extend(stories)
+                # Add to sprint backlog, prioritizing based on story points
+                sprint_backlog_size = config.strategy_configs[DevelopmentStrategy.AGILE.value].get("sprint_batch_size", 5)
+
+                # Sort by story points (smaller first) for better sprint planning
+                stories_sorted = sorted(stories, key=lambda x: x.get('story_points', 1))
+                new_sprint_items = stories_sorted[:sprint_backlog_size]
+
+                # Add to existing sprint backlog with timestamps
+                current_time = time.time()
+                for story in new_sprint_items:
+                    story['added_at'] = current_time
+                self.project_state.sprint_backlog.extend(new_sprint_items)
+
+                # Update current epic index if we completed all stories for current epic
+                current_epic_idx = getattr(self.project_state, 'current_epic_index', 0)
+                logger.info(f"Current epic index: {current_epic_idx}, Total epics: {len(self.project_state.epics)}")
+
+                # Check if all stories for current epic are completed
+                current_epic_stories = [story for story in self.project_state.user_stories
+                                      if story.get('epic') == self.project_state.epics[current_epic_idx].get('description')]
+
+                # If no stories remain for current epic in sprint backlog, move to next epic
+                epic_stories_in_backlog = [story for story in self.project_state.sprint_backlog
+                                         if story.get('epic') == self.project_state.epics[current_epic_idx].get('description')]
+
+                logger.info(f"Current epic has {len(current_epic_stories)} total stories, {len(epic_stories_in_backlog)} in backlog")
+
+                if not epic_stories_in_backlog and current_epic_stories:
+                    # All stories for current epic are completed, move to next epic
+                    if current_epic_idx < len(self.project_state.epics) - 1:
+                        self.project_state.current_epic_index = current_epic_idx + 1
+                        logger.info(f"Moving to next epic: {self.project_state.epics[current_epic_idx + 1].get('description', 'Unknown')[:50]}...")
+                    else:
+                        # All epics completed
+                        logger.info("All epics completed! Project should be finished.")
+                        # Don't increment beyond the last epic
+
+                return True, f"Refined {len(stories)} user stories. Added {len(new_sprint_items)} to sprint backlog."
+            else:
+                return False, "No user stories were generated from epic refinement."
 
         elif task_type == TaskType.SPRINT_REVIEW.value:
             await self.execute_sprint_review()
@@ -5671,6 +7079,10 @@ Backend: http://localhost:8000/health
 
         language = file_blueprint.language
 
+        # Handle refactoring tasks specially
+        if task.get("task_type") == TaskType.REFACTOR.value:
+            return await self._execute_refactoring_task(task, dev_strategy)
+
         feedback = None
 
         # Strict TDD: write tests first, then implement code until tests pass
@@ -5768,9 +7180,26 @@ Backend: http://localhost:8000/health
                     logger.info(f"Code for {target_file} passed validation.")
                     self.assembler.add_file(target_file, generated_code)
                     self.assembler.write_files_to_disk()
+
+                    # Extract and store code patterns from successful, high-quality code
+                    await self.ai.extract_and_store_code_patterns(
+                        generated_code,
+                        target_file,
+                        self.project_state.goal,
+                        dev_strategy,
+                        self.project_state.cognitive_state
+                    )
+
                     # Update file activity counter
                     cnt = self.project_state.file_activity_counts.get(target_file, 0)
                     self.project_state.file_activity_counts[target_file] = cnt + 1
+
+                    # Automated refactoring loop: After every N development tasks, trigger refactoring
+                    refactoring_trigger_interval = getattr(config, 'refactoring_trigger_interval', 5)
+                    if len(self.project_state.completed_tasks) % refactoring_trigger_interval == 0:
+                        logger.info(f"Completed {len(self.project_state.completed_tasks)} tasks. Triggering automated refactoring analysis...")
+                        await self._trigger_automated_refactoring()
+
                     return (
                         True,
                         f"Successfully generated and validated code for {target_file}.",
@@ -5869,25 +7298,86 @@ Backend: http://localhost:8000/health
 
     async def execute_sprint_review(self):
         """Agile sprint review and retrospective."""
-        retrospective_prompt = f"Review sprint for {self.project_state.current_epic}"
-        retrospective = await self.ai._make_api_call(
-            retrospective_prompt,
-            "Retrospective",
-            is_json=False,
-            cognitive_state=self.project_state.cognitive_state,
-            dev_strategy=DevelopmentStrategy.AGILE.value,
-        )
-        self.project_state.velocity_history.append(
-            len([t for t in self.project_state.completed_tasks if "sprint" in str(t)])
-        )
+        logger.info("Executing Agile sprint review and retrospective...")
+
+        # Get sprint statistics
+        all_completed_tasks = self.project_state.completed_tasks
+        sprint_start_idx = max(0, len(all_completed_tasks) - 14)  # Last 14 tasks for this sprint
+        sprint_tasks = all_completed_tasks[sprint_start_idx:]
+
+        # Calculate velocity (tasks completed in this sprint)
+        velocity = len(sprint_tasks)
+
+        # Update velocity history
+        self.project_state.velocity_history.append(velocity)
+        logger.info(f"Sprint velocity: {velocity} tasks completed")
+
+        # Calculate average velocity across all sprints
+        avg_velocity = sum(self.project_state.velocity_history) / len(self.project_state.velocity_history) if self.project_state.velocity_history else 0
+        logger.info(f"Average velocity across all sprints: {avg_velocity:.1f} tasks")
+
+        # Update current epic progress
+        if self.project_state.epics:
+            current_epic_idx = getattr(self.project_state, 'current_epic_index', 0)
+            if current_epic_idx < len(self.project_state.epics):
+                current_epic = self.project_state.epics[current_epic_idx]
+                completed_stories = len([t for t in sprint_tasks if "user story" in t.lower() or "implement" in t.lower()])
+                epic_story_points = sum(story.get('story_points', 1) for story in self.project_state.user_stories[:5])  # Top 5 stories
+
+                logger.info(f"Current epic: {current_epic.get('description', 'Unknown')[:50]}...")
+                logger.info(f"Stories completed this sprint: {completed_stories}")
+                logger.info(f"Estimated epic progress: {completed_stories}/5 stories")
+
+        # Generate retrospective insights
+        retrospective_prompt = f"""
+        Perform an Agile retrospective for the completed sprint.
+
+        Sprint Statistics:
+        - Tasks completed: {velocity}
+        - Average velocity: {avg_velocity:.1f}
+        - Total completed tasks: {len(all_completed_tasks)}
+
+        Current project state:
+        - Goal: {self.project_state.goal}
+        - Epics planned: {len(self.project_state.epics) if self.project_state.epics else 0}
+        - User stories in backlog: {len(self.project_state.user_stories)}
+
+        Provide insights on:
+        1. What went well in this sprint
+        2. What could be improved
+        3. Action items for next sprint
+        4. Sprint predictability assessment
+        """
+
+        try:
+            retrospective = await self.ai._make_api_call(
+                retrospective_prompt,
+                "Retrospective",
+                is_json=False,
+                cognitive_state=self.project_state.cognitive_state,
+                dev_strategy=DevelopmentStrategy.AGILE.value,
+            )
+            logger.info(f"Retrospective insights: {retrospective[:200]}...")
+        except Exception as e:
+            logger.warning(f"Could not generate retrospective: {e}")
+            retrospective = "Retrospective generation failed, but sprint review completed."
+
+        # Store retrospective in memory
         self.memory.add_memory(
             self.goal,
             self.project_state.living_blueprint,
-            strategy=["agile"],
+            strategy=["agile", "retrospective"],
             cognitive_state=self.project_state.cognitive_state,
             dev_strategy=DevelopmentStrategy.AGILE.value,
+            metadata={
+                "sprint_velocity": velocity,
+                "average_velocity": avg_velocity,
+                "sprint_retrospective": retrospective,
+                "completed_tasks": len(all_completed_tasks)
+            }
         )
-        logger.info("Sprint review and retrospective completed.")
+
+        logger.info(f"Sprint review completed. Velocity: {velocity}, Average: {avg_velocity:.1f}")
 
     async def _init_git_repo(self):
         """Initialize Git for DevOps."""
