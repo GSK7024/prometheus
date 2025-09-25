@@ -1756,8 +1756,9 @@ def is_retryable_api_error(exception: BaseException) -> bool:
 class QuantumCognitiveAI:
     """Advanced AI interaction layer with quantum-inspired cognitive capabilities"""
 
-    def __init__(self, llm_choice: str = "api", api_keys: Dict[str, str] = None):
+    def __init__(self, llm_choice: str = "api", api_keys: Dict[str, str] = None, orchestrator: Optional[Any] = None):
         self.llm_choice = llm_choice
+        self.orchestrator = orchestrator  # Reference to the orchestrator for memory access
         self.api_call_count = 0
         self.last_call_time = 0
         self.rate_limit_lock = asyncio.Lock()
@@ -2671,11 +2672,13 @@ Please repair and return ONLY valid JSON that conforms to the schema. No explana
         file_blueprint = living_blueprint.get_file(target_file)
 
         # Retrieve relevant code patterns for memory-augmented generation
-        relevant_patterns = await self.retrieve_relevant_patterns({
-            "dev_strategy": dev_strategy,
-            "task_type": task.get("task_type"),
-            "file_type": file_blueprint.language
-        })
+        relevant_patterns = []
+        if self.orchestrator and hasattr(self.orchestrator, 'retrieve_relevant_patterns'):
+            relevant_patterns = await self.orchestrator.retrieve_relevant_patterns({
+                "dev_strategy": dev_strategy,
+                "task_type": task.get("task_type"),
+                "file_type": file_blueprint.language
+            })
 
         # Format patterns for inclusion in prompt
         patterns_text = ""
@@ -2752,6 +2755,135 @@ Quality Score: {pattern.get('quality_score', 0.0)}
                 logger.warning(f"Code still has high complexity ({final_complexity}) after refactoring attempt.")
 
         return cleaned_code
+
+    async def extract_and_store_code_patterns(
+        self,
+        code: str,
+        file_name: str,
+        goal: str,
+        dev_strategy: str,
+        cognitive_state: Dict = None
+    ) -> None:
+        """Extract architectural and coding patterns from high-quality code and store in memory."""
+        try:
+            # Only extract patterns from successful, high-quality code
+            if not code or len(code.strip()) < 100:
+                return
+
+            # Analyze code structure and patterns
+            patterns = await self._analyze_code_patterns(code, file_name, goal, dev_strategy)
+
+            # Store patterns in neuromorphic memory via orchestrator
+            if patterns and self.orchestrator and hasattr(self.orchestrator, '_store_pattern_in_memory'):
+                for pattern in patterns:
+                    await self.orchestrator._store_pattern_in_memory(pattern, cognitive_state)
+
+                logger.info(f"Extracted and stored {len(patterns)} code patterns from {file_name}")
+
+        except Exception as e:
+            logger.warning(f"Failed to extract code patterns: {e}")
+
+    async def _analyze_code_patterns(self, code: str, file_name: str, goal: str, dev_strategy: str) -> List[Dict]:
+        """Analyze code and extract architectural/coding patterns."""
+        patterns = []
+
+        # Pattern 1: Async/Await Patterns
+        if "async def" in code and "await" in code:
+            patterns.append({
+                "type": "architectural",
+                "category": "async",
+                "name": "Modern Async/Await Patterns",
+                "description": "Clean async/await implementation with proper error handling",
+                "code_snippet": self._extract_async_pattern(code),
+                "applicable_contexts": ["async_operations", "concurrent_processing", "io_bound_tasks"],
+                "quality_score": 0.95
+            })
+
+        # Pattern 2: Exception Handling
+        if "try:" in code and "except" in code:
+            patterns.append({
+                "type": "error_handling",
+                "category": "exception_handling",
+                "name": "Comprehensive Exception Handling",
+                "description": "Robust error handling with specific exception types and logging",
+                "code_snippet": self._extract_exception_pattern(code),
+                "applicable_contexts": ["error_handling", "robustness", "debugging"],
+                "quality_score": 0.90
+            })
+
+        # Pattern 3: Configuration Management
+        if "config" in code.lower() and ("json" in code or "yaml" in code or "env" in code):
+            patterns.append({
+                "type": "configuration",
+                "category": "config_management",
+                "name": "Externalized Configuration",
+                "description": "Proper configuration management with environment variables and files",
+                "code_snippet": self._extract_config_pattern(code),
+                "applicable_contexts": ["configuration", "environment_management", "deployment"],
+                "quality_score": 0.88
+            })
+
+        # Pattern 4: Logging
+        if "logger" in code or "logging" in code:
+            patterns.append({
+                "type": "monitoring",
+                "category": "logging",
+                "name": "Structured Logging",
+                "description": "Comprehensive logging with structured format and context",
+                "code_snippet": self._extract_logging_pattern(code),
+                "applicable_contexts": ["monitoring", "debugging", "observability"],
+                "quality_score": 0.87
+            })
+
+        return patterns
+
+    def _extract_async_pattern(self, code: str) -> str:
+        """Extract async pattern from code."""
+        lines = code.split('\n')
+        pattern_lines = []
+
+        for i, line in enumerate(lines):
+            if 'async def' in line or 'await' in line:
+                pattern_lines.extend(lines[max(0, i-1):min(len(lines), i+5)])
+                break
+
+        return '\n'.join(pattern_lines[:15])
+
+    def _extract_exception_pattern(self, code: str) -> str:
+        """Extract exception handling pattern from code."""
+        lines = code.split('\n')
+        pattern_lines = []
+
+        for i, line in enumerate(lines):
+            if 'try:' in line or 'except' in line:
+                pattern_lines.extend(lines[max(0, i-1):min(len(lines), i+8)])
+                break
+
+        return '\n'.join(pattern_lines[:15])
+
+    def _extract_config_pattern(self, code: str) -> str:
+        """Extract configuration pattern from code."""
+        lines = code.split('\n')
+        pattern_lines = []
+
+        for i, line in enumerate(lines):
+            if 'config' in line.lower() or 'json' in line or 'env' in line:
+                pattern_lines.extend(lines[max(0, i-1):min(len(lines), i+5)])
+                break
+
+        return '\n'.join(pattern_lines[:10])
+
+    def _extract_logging_pattern(self, code: str) -> str:
+        """Extract logging pattern from code."""
+        lines = code.split('\n')
+        pattern_lines = []
+
+        for i, line in enumerate(lines):
+            if 'logger' in line or 'logging' in line:
+                pattern_lines.extend(lines[max(0, i-1):min(len(lines), i+5)])
+                break
+
+        return '\n'.join(pattern_lines[:10])
 
     async def extract_and_store_code_patterns(
         self,
@@ -4747,7 +4879,7 @@ class UltraCognitiveForgeOrchestrator:
         threading.current_thread().dev_strategy = dev_strategy  # Set strategy in thread
 
         # Initialize AI with cognitive capabilities
-        self.ai = QuantumCognitiveAI(llm_choice=llm_choice)
+        self.ai = QuantumCognitiveAI(llm_choice=llm_choice, orchestrator=self)
         self.memory = NeuromorphicMemoryManager()
         self.assembler = CognitiveFileAssembler(self.sandbox_dir, agent_filename)
         self.shell = CognitiveShellCommander(self.sandbox_dir)
@@ -4822,10 +4954,10 @@ services:
 volumes:
   db_data:
 """.strip()
-        self.assembler.add_file("docker-compose.yml", compose)
+    self.assembler.add_file("docker-compose.yml", compose)
 
-        # Backend: requirements
-        be_req = """
+    # Backend: requirements
+    be_req = """
 fastapi==0.114.2
 uvicorn[standard]==0.30.6
 sqlalchemy==2.0.34
@@ -4836,9 +4968,9 @@ alembic==1.13.2
 passlib[bcrypt]==1.7.4
 python-jose[cryptography]==3.3.0
 """.strip()
-        self.assembler.add_file(f"{be_root}/requirements.txt", be_req)
+    self.assembler.add_file(f"{be_root}/requirements.txt", be_req)
 
-        be_docker = """
+    be_docker = """
 FROM python:3.11-slim
 WORKDIR /app
 ENV PYTHONUNBUFFERED=1
@@ -4852,18 +4984,18 @@ RUN chmod +x ./start.sh
 EXPOSE 8000
 CMD ["./start.sh"]
 """.strip()
-        self.assembler.add_file(f"{be_root}/Dockerfile", be_docker)
+    self.assembler.add_file(f"{be_root}/Dockerfile", be_docker)
 
-        be_start = """
+    be_start = """
 #!/bin/sh
 set -e
 export PYTHONPATH=/app
 alembic upgrade head || true
 exec uvicorn app.main:app --host 0.0.0.0 --port ${UVICORN_PORT:-8000}
 """.strip()
-        self.assembler.add_file(f"{be_root}/start.sh", be_start)
+    self.assembler.add_file(f"{be_root}/start.sh", be_start)
 
-        be_main = """
+    be_main = """
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -4885,9 +5017,9 @@ def health():
 def root():
     return {"message": "Backend running"}
 """.strip()
-        self.assembler.add_file(f"{be_root}/app/main.py", be_main)
+    self.assembler.add_file(f"{be_root}/app/main.py", be_main)
 
-        be_db = """
+    be_db = """
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, DeclarativeBase
 import os
@@ -4907,31 +5039,32 @@ def get_db():
     finally:
         db.close()
 """.strip()
-        self.assembler.add_file(f"{be_root}/app/db.py", be_db)
+    self.assembler.add_file(f"{be_root}/app/db.py", be_db)
 
-    def _extract_core_functionality_from_memory(self, text: str) -> Optional[str]:
-        """Extract core functionality from text using memory manager method."""
-        # Since the method exists in the memory manager, we need to access it through self.memory
-        # But the memory manager method is an instance method, so we need to call it properly
-        try:
-            # Try to call the method on the memory manager
-            if hasattr(self.memory, '_extract_core_functionality'):
-                return self.memory._extract_core_functionality(text)
-            else:
-                # Fallback to simple matching if method not available
-                return self._simple_core_extraction(text)
-        except Exception:
+def _extract_core_functionality_from_memory(self, text: str) -> Optional[str]:
+    """Extract core functionality from text using memory manager method."""
+    # Since the method exists in the memory manager, we need to access it through self.memory
+    # But the memory manager method is an instance method, so we need to call it properly
+    try:
+        # Try to call the method on the memory manager
+        if hasattr(self.memory, '_extract_core_functionality'):
+            return self.memory._extract_core_functionality(text)
+        else:
+            # Fallback to simple matching if method not available
             return self._simple_core_extraction(text)
+    except Exception:
+        return self._simple_core_extraction(text)
 
-    def _simple_core_extraction(self, text: str) -> str:
-        """Simple fallback core functionality extraction."""
-        # Remove common prefixes and suffixes
-        text = text.replace("implement user story:", "").replace("create and implement:", "")
-        text = text.replace("as a", "").replace("as the", "")
-        text = text.replace("so that", "").replace("to", "")
-        return text.strip()[:50]  # Return first 50 chars as simple extraction
+def _simple_core_extraction(self, text: str) -> str:
+    """Simple fallback core functionality extraction."""
+    # Remove common prefixes and suffixes
+    text = text.replace("implement user story:", "").replace("create and implement:", "")
+    text = text.replace("as a", "").replace("as the", "")
+    text = text.replace("so that", "").replace("to", "")
+    return text.strip()[:50]  # Return first 50 chars as simple extraction
 
-        be_models = """
+
+be_models = """
 from sqlalchemy import Column, Integer, String, Boolean, Text, ForeignKey, DateTime
 from sqlalchemy.orm import relationship
 from datetime import datetime
@@ -4956,9 +5089,9 @@ class ChangeEvent(Base):
     diff = Column(Text, default="")
     monitor = relationship("Monitor", back_populates="changes")
 """.strip()
-        self.assembler.add_file(f"{be_root}/app/models.py", be_models)
+self.assembler.add_file(f"{be_root}/app/models.py", be_models)
 
-        be_schemas = """
+be_schemas = """
 from pydantic import BaseModel, HttpUrl, Field
 from typing import Optional, List
 from datetime import datetime
@@ -4987,9 +5120,9 @@ class ChangeEventRead(BaseModel):
     class Config:
         from_attributes = True
 """.strip()
-        self.assembler.add_file(f"{be_root}/app/schemas.py", be_schemas)
+self.assembler.add_file(f"{be_root}/app/schemas.py", be_schemas)
 
-        be_router = """
+be_router = """
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from typing import List
@@ -5022,9 +5155,9 @@ def delete_monitor(monitor_id: int, db: Session = Depends(get_db)):
     db.commit()
     return {"ok": True}
 """.strip()
-        self.assembler.add_file(f"{be_root}/app/routers/monitors.py", be_router)
+self.assembler.add_file(f"{be_root}/app/routers/monitors.py", be_router)
 
-        be_main2 = """
+be_main2 = """
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from .routers.monitors import router as monitors_router
@@ -5045,10 +5178,10 @@ def health():
 
 app.include_router(monitors_router)
 """.strip()
-        self.assembler.add_file(f"{be_root}/app/main.py", be_main2)
+self.assembler.add_file(f"{be_root}/app/main.py", be_main2)
 
         # Auth models, schemas, router
-        be_auth_models = """
+be_auth_models = """
 from sqlalchemy import Column, Integer, String, DateTime, UniqueConstraint
 from datetime import datetime
 from .db import Base
@@ -5061,9 +5194,9 @@ class User(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     __table_args__ = (UniqueConstraint('email', name='uq_users_email'),)
 """.strip()
-        self.assembler.add_file(f"{be_root}/app/auth_models.py", be_auth_models)
+self.assembler.add_file(f"{be_root}/app/auth_models.py", be_auth_models)
 
-        be_auth_schemas = """
+be_auth_schemas = """
 from pydantic import BaseModel, EmailStr
 
 class UserCreate(BaseModel):
@@ -5074,9 +5207,9 @@ class Token(BaseModel):
     access_token: str
     token_type: str = 'bearer'
 """.strip()
-        self.assembler.add_file(f"{be_root}/app/auth_schemas.py", be_auth_schemas)
+self.assembler.add_file(f"{be_root}/app/auth_schemas.py", be_auth_schemas)
 
-        be_auth = """
+be_auth = """
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from passlib.context import CryptContext
@@ -5124,9 +5257,9 @@ def login(payload: UserCreate, db: Session = Depends(get_db)):
         raise HTTPException(status_code=401, detail='Invalid credentials')
     return Token(access_token=create_token(u.id, u.email))
 """.strip()
-        self.assembler.add_file(f"{be_root}/app/routers/auth.py", be_auth)
+self.assembler.add_file(f"{be_root}/app/routers/auth.py", be_auth)
 
-        be_main3 = """
+be_main3 = """
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from .routers.monitors import router as monitors_router
@@ -5149,10 +5282,10 @@ def health():
 app.include_router(auth_router)
 app.include_router(monitors_router)
 """.strip()
-        self.assembler.add_file(f"{be_root}/app/main.py", be_main3)
+self.assembler.add_file(f"{be_root}/app/main.py", be_main3)
 
         # Alembic setup
-        alembic_ini = """
+alembic_ini = """
 [alembic]
 script_location = alembic
 sqlalchemy.url = %(DATABASE_URL)s
@@ -5189,9 +5322,9 @@ formatter = generic
 [formatter_generic]
 format = %(levelname)-5.5s [%(name)s] %(message)s
 """.strip()
-        self.assembler.add_file(f"{be_root}/alembic.ini", alembic_ini)
+self.assembler.add_file(f"{be_root}/alembic.ini", alembic_ini)
 
-        alembic_env = """
+alembic_env = """
 from logging.config import fileConfig
 from sqlalchemy import engine_from_config
 from sqlalchemy import pool
@@ -5230,7 +5363,7 @@ if context.is_offline_mode():
 else:
     run_migrations_online()
 """.strip()
-        self.assembler.add_file(f"{be_root}/alembic/env.py", alembic_env)
+self.assembler.add_file(f"{be_root}/alembic/env.py", alembic_env)
 
         alembic_ver = """
 """.strip()
@@ -7049,7 +7182,7 @@ Backend: http://localhost:8000/health
                     self.assembler.write_files_to_disk()
 
                     # Extract and store code patterns from successful, high-quality code
-                    await self.extract_and_store_code_patterns(
+                    await self.ai.extract_and_store_code_patterns(
                         generated_code,
                         target_file,
                         self.project_state.goal,
