@@ -1,0 +1,273 @@
+{
+  "system": {
+    "name": "TDD-First Prometheus AI System",
+    "version": "2.0.0",
+    "description": "Advanced AI system using pure Test-Driven Development across all domains",
+    "author": "TDD Prometheus AI",
+    "created": "2024-09-25T00:00:00Z"
+  },
+  "planner": {
+    "max_analysis_depth": 10,
+    "max_test_suites_per_plan": 20,
+    "max_test_cases_per_suite": 50,
+    "enable_deep_thinking": true,
+    "enable_risk_assessment": true,
+    "enable_complexity_analysis": true,
+    "enable_domain_optimization": true,
+    "thinking_timeout_seconds": 300
+  },
+  "code_generator": {
+    "temp_directory_prefix": "tdd_prometheus_",
+    "keep_temp_files": false,
+    "cleanup_on_exit": true,
+    "generate_requirements_file": true,
+    "generate_readme": true,
+    "generate_configuration": true,
+    "generate_documentation": true,
+    "generate_examples": true
+  },
+  "testing": {
+    "test_runner": "pytest",
+    "test_verbosity": 2,
+    "fail_fast": false,
+    "parallel_execution": true,
+    "coverage_reporting": true,
+    "coverage_threshold": 85.0,
+    "generate_test_reports": true,
+    "test_report_format": "html"
+  },
+  "domains": {
+    "aerospace": {
+      "enabled": true,
+      "priority": "high",
+      "specialized_patterns": [
+        "orbital_mechanics",
+        "propulsion_systems",
+        "structural_analysis",
+        "thermal_management",
+        "guidance_navigation"
+      ],
+      "validation_libraries": [
+        "numpy",
+        "scipy",
+        "matplotlib",
+        "pytest"
+      ]
+    },
+    "web_development": {
+      "enabled": true,
+      "priority": "high",
+      "specialized_patterns": [
+        "rest_apis",
+        "authentication",
+        "database_operations",
+        "user_interfaces",
+        "security"
+      ],
+      "validation_libraries": [
+        "flask",
+        "pytest",
+        "pytest-flask",
+        "requests"
+      ]
+    },
+    "data_science": {
+      "enabled": true,
+      "priority": "medium",
+      "specialized_patterns": [
+        "data_processing",
+        "machine_learning",
+        "statistical_analysis",
+        "data_visualization"
+      ],
+      "validation_libraries": [
+        "pandas",
+        "numpy",
+        "scikit-learn",
+        "matplotlib"
+      ]
+    },
+    "machine_learning": {
+      "enabled": true,
+      "priority": "medium",
+      "specialized_patterns": [
+        "model_training",
+        "data_preprocessing",
+        "feature_engineering",
+        "model_evaluation"
+      ],
+      "validation_libraries": [
+        "tensorflow",
+        "pytorch",
+        "scikit-learn",
+        "pytest"
+      ]
+    },
+    "systems_programming": {
+      "enabled": true,
+      "priority": "medium",
+      "specialized_patterns": [
+        "memory_management",
+        "performance_optimization",
+        "system_calls"
+      ],
+      "validation_libraries": [
+        "pytest",
+        "psutil",
+        "memory_profiler"
+      ]
+    },
+    "mobile_development": {
+      "enabled": true,
+      "priority": "medium",
+      "specialized_patterns": [
+        "user_interfaces",
+        "device_apis",
+        "offline_capabilities"
+      ],
+      "validation_libraries": [
+        "pytest",
+        "pytest-mobile"
+      ]
+    },
+    "game_development": {
+      "enabled": true,
+      "priority": "low",
+      "specialized_patterns": [
+        "game_engines",
+        "physics_simulation",
+        "graphics_rendering"
+      ],
+      "validation_libraries": [
+        "pygame",
+        "pytest"
+      ]
+    },
+    "devops": {
+      "enabled": true,
+      "priority": "medium",
+      "specialized_patterns": [
+        "deployment",
+        "monitoring",
+        "infrastructure"
+      ],
+      "validation_libraries": [
+        "pytest",
+        "docker",
+        "kubernetes"
+      ]
+    },
+    "security": {
+      "enabled": true,
+      "priority": "high",
+      "specialized_patterns": [
+        "vulnerability_testing",
+        "penetration_testing",
+        "security_auditing"
+      ],
+      "validation_libraries": [
+        "pytest",
+        "bandit",
+        "safety"
+      ]
+    },
+    "blockchain": {
+      "enabled": true,
+      "priority": "low",
+      "specialized_patterns": [
+        "smart_contracts",
+        "consensus_algorithms",
+        "cryptography"
+      ],
+      "validation_libraries": [
+        "web3",
+        "pytest"
+      ]
+    },
+    "iot": {
+      "enabled": true,
+      "priority": "medium",
+      "specialized_patterns": [
+        "device_communication",
+        "sensor_data",
+        "edge_computing"
+      ],
+      "validation_libraries": [
+        "pytest",
+        "paho-mqtt"
+      ]
+    },
+    "robotics": {
+      "enabled": true,
+      "priority": "medium",
+      "specialized_patterns": [
+        "motion_control",
+        "sensor_fusion",
+        "path_planning"
+      ],
+      "validation_libraries": [
+        "pytest",
+        "numpy",
+        "scipy"
+      ]
+    }
+  },
+  "quality_standards": {
+    "min_test_coverage": 85.0,
+    "max_complexity_per_function": 10,
+    "max_lines_per_function": 50,
+    "require_type_hints": true,
+    "require_docstrings": true,
+    "enforce_pep8": true,
+    "require_error_handling": true,
+    "require_input_validation": true,
+    "require_logging": true
+  },
+  "implementation_guidelines": {
+    "follow_tdd_principles": true,
+    "write_tests_first": true,
+    "implement_minimal_code": true,
+    "refactor_after_tests_pass": true,
+    "maintain_test_coverage": true,
+    "document_all_public_methods": true,
+    "handle_edge_cases": true,
+    "validate_all_inputs": true,
+    "log_important_events": true,
+    "provide_helpful_errors": true
+  },
+  "output_formats": {
+    "python_code": {
+      "file_extension": ".py",
+      "encoding": "utf-8",
+      "line_endings": "unix",
+      "indentation": "4_spaces",
+      "max_line_length": 88
+    },
+    "test_files": {
+      "naming_convention": "test_*.py",
+      "location": "tests/",
+      "include_setup": true,
+      "include_teardown": true
+    },
+    "documentation": {
+      "format": "markdown",
+      "include_examples": true,
+      "include_api_reference": true,
+      "include_usage_guide": true
+    }
+  },
+  "risk_management": {
+    "enable_risk_assessment": true,
+    "require_risk_mitigation": true,
+    "track_technical_debt": true,
+    "monitor_performance_impact": true,
+    "validate_security_implications": true
+  },
+  "monitoring": {
+    "enable_performance_monitoring": true,
+    "enable_memory_monitoring": true,
+    "enable_coverage_tracking": true,
+    "enable_quality_metrics": true,
+    "generate_implementation_reports": true
+  }
+}
