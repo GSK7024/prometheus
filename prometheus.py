@@ -6276,7 +6276,7 @@ Backend: http://localhost:8000/health
 
         # Calculate average velocity across all sprints
         avg_velocity = sum(self.project_state.velocity_history) / len(self.project_state.velocity_history) if self.project_state.velocity_history else 0
-        logger.info(f"Average velocity across all sprints: {avg_velocity".1f"} tasks")
+        logger.info(f"Average velocity across all sprints: {avg_velocity:.1f} tasks")
 
         # Update current epic progress
         if self.project_state.epics:
@@ -6296,7 +6296,7 @@ Backend: http://localhost:8000/health
 
         Sprint Statistics:
         - Tasks completed: {velocity}
-        - Average velocity: {avg_velocity".1f"}
+        - Average velocity: {avg_velocity:.1f}
         - Total completed tasks: {len(all_completed_tasks)}
 
         Current project state:
@@ -6339,7 +6339,7 @@ Backend: http://localhost:8000/health
             }
         )
 
-        logger.info(f"Sprint review completed. Velocity: {velocity}, Average: {avg_velocity".1f"}")
+        logger.info(f"Sprint review completed. Velocity: {velocity}, Average: {avg_velocity:.1f}")
 
     async def _init_git_repo(self):
         """Initialize Git for DevOps."""
