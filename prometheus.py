@@ -5309,6 +5309,9 @@ Backend: http://localhost:8000/health
         # Strategy-aware next task selection
         # Agile: pull next user story from sprint backlog and convert into a concrete dev task
         if self.project_state.development_strategy == DevelopmentStrategy.AGILE.value:
+            # Initialize to_enqueue to empty list to avoid scope issues
+            to_enqueue = []
+
             # Prevent infinite churn on the same file: count last N tasks by target_file
             # Check all files that have been worked on recently
             overworked_files = []
@@ -5370,7 +5373,7 @@ Backend: http://localhost:8000/health
 
             # If no tasks were enqueued (empty sprint backlog), skip to CEO Strategist
             if not to_enqueue:
-                logger.warning("Sprint backlog is empty - no tasks to enqueue")
+                logger.warning("Sprint backlog is empty or all stories filtered out - no tasks to enqueue")
                 # Don't continue with task generation - let it fall through to CEO Strategist
                 return None
             else:
@@ -5378,7 +5381,12 @@ Backend: http://localhost:8000/health
                     f.filename for f in self.project_state.living_blueprint.root if f.filename.endswith(".py")
                 ]
                 if not candidate_files:
-                    candidate_files = ["src/agent.py"]
+                    candidate_files = ["main.py"]  # Fallback to main.py if no Python files exist
+
+                # Ensure we have at least one candidate file
+                if not candidate_files:
+                    logger.error("No candidate files available for task assignment")
+                    return None
 
                 # Filter out tasks that are likely to fail due to missing dependencies or paths
                 valid_stories = []
@@ -5392,10 +5400,16 @@ Backend: http://localhost:8000/health
 
                 if not valid_stories:
                     logger.warning("All stories filtered out due to potential issues - consulting CEO Strategist")
+                    # Reset to_enqueue to empty since no valid stories
+                    to_enqueue = []
                     return None
 
                 for story in valid_stories:
                     # Round-robin file assignment to spread work and avoid churn
+                    # Ensure file_rotation_idx is valid and doesn't exceed list bounds
+                    if self.project_state.file_rotation_idx >= len(candidate_files):
+                        self.project_state.file_rotation_idx = 0
+
                     idx = self.project_state.file_rotation_idx % len(candidate_files)
                     target_file = candidate_files[idx]
                     self.project_state.file_rotation_idx += 1
