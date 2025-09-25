@@ -1,0 +1,104 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "prometheus-ai-enhanced"
+version = "2.0.0"
+description = "Enhanced Prometheus AI - Ultimate AI Coding System with NASA-level capabilities"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Enhanced AI Team", email = "team@prometheus-ai.com"}
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+requires-python = ">=3.8"
+dependencies = [
+    "torch>=2.0.0",
+    "numpy>=1.21.0",
+    "transformers>=4.21.0",
+    "sentence-transformers>=2.2.0",
+    "chromadb>=0.4.0",
+    "faiss-cpu>=1.7.0",
+    "scikit-learn>=1.0.0",
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0.0",
+    "httpx>=0.24.0",
+    "python-dotenv>=1.0.0",
+    "psutil>=5.9.0",
+    "tenacity>=8.0.0",
+    "gitpython>=3.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "black>=23.0.0",
+    "isort>=5.12.0",
+    "pre-commit>=3.0.0",
+]
+cloud = [
+    "docker>=6.0.0",
+    "kubernetes>=26.0.0",
+]
+testing = [
+    "coverage>=7.0.0",
+    "pytest-xdist>=3.0.0",
+    "pytest-asyncio>=0.21.0",
+]
+
+[project.scripts]
+prometheus = "prometheus_launcher:main"
+prometheus-test = "test_system:main"
+
+[project.urls]
+Homepage = "https://github.com/your-repo/prometheus-ai-enhanced"
+Documentation = "https://github.com/your-repo/prometheus-ai-enhanced/docs"
+Repository = "https://github.com/your-repo/prometheus-ai-enhanced"
+Issues = "https://github.com/your-repo/prometheus-ai-enhanced/issues"
+
+[tool.setuptools]
+packages = ["prometheus"]
+
+[tool.setuptools.package-dir]
+"" = "."
+
+[tool.black]
+line-length = 100
+target-version = ['py38', 'py39', 'py310', 'py311']
+
+[tool.isort]
+profile = "black"
+multi_line_output = 3
+line_length = 100
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short --strict-markers"
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+    "unit: marks tests as unit tests",
+]
