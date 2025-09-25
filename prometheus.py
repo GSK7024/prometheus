@@ -308,6 +308,33 @@ class NeuromorphicMemory:
         if len(self.memory_data) % 50 == 0:  # More frequent updates
             self.update_clustering()
 
+    def _extract_core_functionality(self, text: str) -> Optional[str]:
+        """Extract core functionality from task/story description for better matching"""
+
+        # Remove common prefixes and suffixes
+        text = re.sub(r'^(as a|as the|implement|create|build|develop)\s+', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'\s+(so that|to|for|with|using).*$', '', text, flags=re.IGNORECASE)
+
+        # Extract key action words and objects
+        key_patterns = [
+            r'(create|add|build|make)\s+(new\s+)?(\w+)',
+            r'(retrieve|get|fetch|read)\s+(\w+)',
+            r'(update|modify|edit|change)\s+(\w+)',
+            r'(delete|remove|destroy)\s+(\w+)',
+            r'(mark|set)\s+(\w+)\s+(complete|done|finished)',
+            r'(validate|check|verify)\s+(\w+)'
+        ]
+
+        for pattern in key_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                return match.group(0).lower().strip()
+
+        # If no pattern matches, return the text with common words removed
+        words_to_remove = ['task', 'system', 'user', 'backend', 'developer', 'application', 'app']
+        core_words = [word for word in text.split() if word.lower() not in words_to_remove]
+        return ' '.join(core_words[:5]) if core_words else text.strip()
+
     def retrieve_similar(self, query, k=10):  # Increased k for broader recall
         """Retrieve similar memories with relevance filtering."""
         query_embedding = self.embed_text(query)
@@ -4920,17 +4947,27 @@ Backend: http://localhost:8000/health
                         if "Diversify focus:" in task_desc:
                             logger.info("Skipping sprint backlog cleanup for diversify task (not a real user story)")
                         else:
-                            # Remove the corresponding story from sprint backlog
+                            # Remove the corresponding story from sprint backlog using better matching
                             stories_removed = 0
+                            task_lower = task_desc.lower()
                             for i, story in enumerate(self.project_state.sprint_backlog[:]):  # Create copy to avoid modification during iteration
                                 story_desc = story.get("description", "")
-                                if story_desc in task_desc or task_desc in story_desc:
+                                story_lower = story_desc.lower()
+
+                                # Better matching: check if the core functionality matches
+                                # Look for key phrases that indicate the same user story
+                                task_core = self._extract_core_functionality(task_lower)
+                                story_core = self._extract_core_functionality(story_lower)
+
+                                if task_core and story_core and (task_core in story_core or story_core in task_core):
                                     self.project_state.sprint_backlog.pop(i)
                                     logger.info(f"Removed completed story from sprint backlog: {story_desc}")
                                     stories_removed += 1
+                                    break  # Only remove one story per task
 
                             if stories_removed == 0:
                                 logger.warning(f"No matching story found in sprint backlog for task: {task_desc}")
+                                logger.info(f"Sprint backlog contains: {[s.get('description', 'No desc')[:50] for s in self.project_state.sprint_backlog[:3]]}...")
 
                         logger.info(f"Sprint backlog now has {len(self.project_state.sprint_backlog)} items")
 
@@ -5615,10 +5652,16 @@ Backend: http://localhost:8000/health
                 return True
 
             # Check if we've completed a significant number of tasks
-            if len(self.project_state.completed_tasks) >= 15:
+            completed_count = len(self.project_state.completed_tasks)
+            if completed_count >= 15:
                 # Check if sprint backlog is empty (no more work to do)
                 if not self.project_state.sprint_backlog:
                     logger.info("Goal achieved - significant progress made and no remaining sprint backlog")
+                    return True
+
+                # Check if we're stuck in a loop (same stories being generated repeatedly)
+                if completed_count >= 25:  # Allow more tasks for complex projects
+                    logger.info(f"Goal achieved - completed {completed_count} tasks with remaining backlog. Likely complete.")
                     return True
 
         # Check for general completion criteria
@@ -5961,8 +6004,27 @@ Backend: http://localhost:8000/health
 
                 # Update current epic index if we completed all stories for current epic
                 current_epic_idx = getattr(self.project_state, 'current_epic_index', 0)
-                if current_epic_idx < len(self.project_state.epics) - 1:
-                    self.project_state.current_epic_index = current_epic_idx + 1
+                logger.info(f"Current epic index: {current_epic_idx}, Total epics: {len(self.project_state.epics)}")
+
+                # Check if all stories for current epic are completed
+                current_epic_stories = [story for story in self.project_state.user_stories
+                                      if story.get('epic') == self.project_state.epics[current_epic_idx].get('description')]
+
+                # If no stories remain for current epic in sprint backlog, move to next epic
+                epic_stories_in_backlog = [story for story in self.project_state.sprint_backlog
+                                         if story.get('epic') == self.project_state.epics[current_epic_idx].get('description')]
+
+                logger.info(f"Current epic has {len(current_epic_stories)} total stories, {len(epic_stories_in_backlog)} in backlog")
+
+                if not epic_stories_in_backlog and current_epic_stories:
+                    # All stories for current epic are completed, move to next epic
+                    if current_epic_idx < len(self.project_state.epics) - 1:
+                        self.project_state.current_epic_index = current_epic_idx + 1
+                        logger.info(f"Moving to next epic: {self.project_state.epics[current_epic_idx + 1].get('description', 'Unknown')[:50]}...")
+                    else:
+                        # All epics completed
+                        logger.info("All epics completed! Project should be finished.")
+                        # Don't increment beyond the last epic
 
                 return True, f"Refined {len(stories)} user stories. Added {len(new_sprint_items)} to sprint backlog."
             else:
