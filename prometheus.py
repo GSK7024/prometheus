@@ -265,7 +265,7 @@ class NeuromorphicMemory:
         embedding = outputs.last_hidden_state.mean(dim=1).numpy()
         return embedding / np.linalg.norm(embedding)  # L2 normalization
 
-    def add_memory(self, data, metadata=None):
+    def add_memory(self, data, metadata=None, strategy=None, cognitive_state=None, dev_strategy=None):
         """Add memory with relevance scoring and forgetting check."""
         embedding = self.embed_text(str(data))
         if embedding is None:
@@ -287,9 +287,20 @@ class NeuromorphicMemory:
             logger.debug("Memory forgotten due to low relevance.")
             return
 
+        # Combine all metadata
+        combined_metadata = {}
+        if metadata:
+            combined_metadata.update(metadata)
+        if strategy:
+            combined_metadata["strategy"] = strategy
+        if cognitive_state:
+            combined_metadata["cognitive_state"] = cognitive_state
+        if dev_strategy:
+            combined_metadata["dev_strategy"] = dev_strategy
+
         self.memory_index.add(embedding)
         self.memory_data.append(data)
-        self.memory_metadata.append(metadata or {})
+        self.memory_metadata.append(combined_metadata)
         # Track embedding for future relevance/cluster computations
         self._embedding_store.append(embedding.squeeze(0))
 
