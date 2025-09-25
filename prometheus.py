@@ -3280,56 +3280,6 @@ Quality Score: {pattern.get('quality_score', 0.0)}
 
         return recommendations
 
-    def _extract_core_functionality(self, text: str) -> Optional[str]:
-        """Extract core functionality from task/story description for better matching"""
-        import re
-
-        # Remove common prefixes and suffixes
-        text = re.sub(r'^(as a|as the|implement|create|build|develop)\s+', '', text, flags=re.IGNORECASE)
-        text = re.sub(r'\s+(so that|to|for|with|using).*$', '', text, flags=re.IGNORECASE)
-
-        # Extract key action words and objects
-        key_patterns = [
-            r'(create|add|build|make)\s+(new\s+)?(\w+)',
-            r'(retrieve|get|fetch|read)\s+(\w+)',
-            r'(update|modify|edit|change)\s+(\w+)',
-            r'(delete|remove|destroy)\s+(\w+)',
-            r'(mark|set)\s+(\w+)\s+(complete|done|finished)',
-            r'(validate|check|verify)\s+(\w+)'
-        ]
-
-        for pattern in key_patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                return match.group(0).lower().strip()
-
-        # If no pattern matches, return the text with common words removed
-        words_to_remove = ['task', 'system', 'user', 'backend', 'developer', 'application', 'app']
-        core_words = [word for word in text.split() if word.lower() not in words_to_remove]
-        return ' '.join(core_words[:5]) if core_words else text.strip()
-
-    def _extract_core_functionality_from_memory(self, text: str) -> Optional[str]:
-        """Extract core functionality from text using memory manager method."""
-        # Since the method exists in the memory manager, we need to access it through self.memory
-        # But the memory manager method is an instance method, so we need to call it properly
-        try:
-            # Try to call the method on the memory manager
-            if hasattr(self.memory, '_extract_core_functionality'):
-                return self.memory._extract_core_functionality(text)
-            else:
-                # Fallback to simple matching if method not available
-                return self._simple_core_extraction(text)
-        except Exception:
-            return self._simple_core_extraction(text)
-
-    def _simple_core_extraction(self, text: str) -> str:
-        """Simple fallback core functionality extraction."""
-        # Remove common prefixes and suffixes
-        text = text.replace("implement user story:", "").replace("create and implement:", "")
-        text = text.replace("as a", "").replace("as the", "")
-        text = text.replace("so that", "").replace("to", "")
-        return text.strip()[:50]  # Return first 50 chars as simple extraction
-
     async def _trigger_automated_refactoring(self) -> None:
         """Trigger automated refactoring analysis and create refactoring tasks."""
         try:
@@ -4958,6 +4908,28 @@ def get_db():
         db.close()
 """.strip()
         self.assembler.add_file(f"{be_root}/app/db.py", be_db)
+
+    def _extract_core_functionality_from_memory(self, text: str) -> Optional[str]:
+        """Extract core functionality from text using memory manager method."""
+        # Since the method exists in the memory manager, we need to access it through self.memory
+        # But the memory manager method is an instance method, so we need to call it properly
+        try:
+            # Try to call the method on the memory manager
+            if hasattr(self.memory, '_extract_core_functionality'):
+                return self.memory._extract_core_functionality(text)
+            else:
+                # Fallback to simple matching if method not available
+                return self._simple_core_extraction(text)
+        except Exception:
+            return self._simple_core_extraction(text)
+
+    def _simple_core_extraction(self, text: str) -> str:
+        """Simple fallback core functionality extraction."""
+        # Remove common prefixes and suffixes
+        text = text.replace("implement user story:", "").replace("create and implement:", "")
+        text = text.replace("as a", "").replace("as the", "")
+        text = text.replace("so that", "").replace("to", "")
+        return text.strip()[:50]  # Return first 50 chars as simple extraction
 
         be_models = """
 from sqlalchemy import Column, Integer, String, Boolean, Text, ForeignKey, DateTime
