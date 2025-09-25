@@ -4837,15 +4837,46 @@ Backend: http://localhost:8000/health
                 task_response = await self.get_next_task(last_task_result)
                 if not task_response or not task_response.get("task_type"):
                     logger.info("No more tasks to execute. Checking goal achievement.")
-                    goal_achieved = await self.check_goal_achievement(last_task_result)
-                    if goal_achieved:
-                        logger.info("Goal has been achieved!")
-                        break
-                    else:
-                        logger.warning(
-                            "Goal not achieved, but no new tasks were generated. Ending run."
-                        )
-                        break
+
+                    # Check for empty sprint backlog and attempt to refill
+                    if (self.project_state.development_strategy == DevelopmentStrategy.AGILE.value
+                        and not self.project_state.sprint_backlog
+                        and self.project_state.epics):
+                        logger.info("Sprint backlog empty but epics available - attempting to generate more user stories")
+
+                        # Try to refine the current epic
+                        current_epic_idx = getattr(self.project_state, 'current_epic_index', 0)
+                        if current_epic_idx < len(self.project_state.epics):
+                            current_epic = self.project_state.epics[current_epic_idx].get("description")
+                            logger.info(f"Attempting to refine epic: {current_epic[:50]}...")
+
+                            stories = await self._refine_user_stories(current_epic)
+                            if stories:
+                                self.project_state.user_stories.extend(stories)
+                                # Add to sprint backlog
+                                sprint_backlog_size = config.strategy_configs[DevelopmentStrategy.AGILE.value].get("sprint_batch_size", 5)
+                                stories_sorted = sorted(stories, key=lambda x: x.get('story_points', 1))
+                                new_sprint_items = stories_sorted[:sprint_backlog_size]
+
+                                current_time = time.time()
+                                for story in new_sprint_items:
+                                    story['added_at'] = current_time
+                                self.project_state.sprint_backlog.extend(new_sprint_items)
+
+                                logger.info(f"Added {len(new_sprint_items)} new stories to sprint backlog")
+                                # Try to get a task again
+                                task_response = await self.get_next_task(last_task_result)
+
+                    if not task_response or not task_response.get("task_type"):
+                        goal_achieved = await self.check_goal_achievement(last_task_result)
+                        if goal_achieved:
+                            logger.info("Goal has been achieved!")
+                            break
+                        else:
+                            logger.warning(
+                                "Goal not achieved, but no new tasks were generated. Ending run."
+                            )
+                            break
 
                 # Execute task with cognitive capabilities
                 success, last_task_result = await self.execute_task(
@@ -4883,10 +4914,49 @@ Backend: http://localhost:8000/health
 
                         logger.info(f"Sprint backlog now has {len(self.project_state.sprint_backlog)} items")
 
+                        # Check if sprint backlog is getting too large due to failed tasks
+                        if len(self.project_state.sprint_backlog) > 20:
+                            logger.warning(f"Sprint backlog has {len(self.project_state.sprint_backlog)} items - cleaning up old/failed stories")
+                            # Remove stories that have been in backlog too long
+                            current_time = time.time()
+                            self.project_state.sprint_backlog = [
+                                story for story in self.project_state.sprint_backlog
+                                if story.get('added_at', current_time) > current_time - 3600  # Keep only last hour
+                            ]
+                            logger.info(f"Sprint backlog cleaned up to {len(self.project_state.sprint_backlog)} items")
+
                     self._update_cognitive_state(success=True)
                 else:
                     logger.warning("Task failed. Will attempt to recover.")
                     await self.handle_task_failure(task_response, last_task_result)
+
+                    # For agile strategy, handle failed tasks by removing problematic stories
+                    if self.project_state.development_strategy == DevelopmentStrategy.AGILE.value:
+                        task_desc = task_response.get("task_description", "")
+                        logger.info(f"Handling failed task: {task_desc}")
+
+                        # Remove failed stories from sprint backlog to prevent repeated failures
+                        failed_stories_removed = 0
+                        for i, story in enumerate(self.project_state.sprint_backlog[:]):  # Create copy to avoid modification during iteration
+                            story_desc = story.get("description", "")
+                            if story_desc in task_desc or task_desc in story_desc:
+                                self.project_state.sprint_backlog.pop(i)
+                                logger.info(f"Removed failed story from sprint backlog: {story_desc}")
+                                failed_stories_removed += 1
+
+                        if failed_stories_removed > 0:
+                            logger.info(f"Removed {failed_stories_removed} failed stories from sprint backlog")
+                        else:
+                            logger.warning(f"No matching story found for failed task: {task_desc}")
+
+                        # Check if we're getting too many failures and need to adjust approach
+                        recent_tasks = self.project_state.completed_tasks[-10:]
+                        failures = [t for t in recent_tasks if "failed" in t.lower() or "failure" in t.lower()]
+                        if len(failures) >= 3:
+                            logger.warning("Multiple recent failures detected - may need to adjust approach")
+                            # Force a sprint review to reassess
+                            await self.execute_sprint_review()
+
                     self._update_cognitive_state(success=False)
 
                 await self.save_state()
@@ -5298,65 +5368,79 @@ Backend: http://localhost:8000/health
 
                 logger.info(f"Enqueuing {len(to_enqueue)} tasks from sprint backlog. Remaining: {len(self.project_state.sprint_backlog)}")
 
-                # If no tasks were enqueued (empty sprint backlog), skip to CEO Strategist
-                if not to_enqueue:
-                    logger.warning("Sprint backlog is empty - no tasks to enqueue")
-                    # Don't continue with task generation - let it fall through to CEO Strategist
+            # If no tasks were enqueued (empty sprint backlog), skip to CEO Strategist
+            if not to_enqueue:
+                logger.warning("Sprint backlog is empty - no tasks to enqueue")
+                # Don't continue with task generation - let it fall through to CEO Strategist
+                return None
+            else:
+                candidate_files = [
+                    f.filename for f in self.project_state.living_blueprint.root if f.filename.endswith(".py")
+                ]
+                if not candidate_files:
+                    candidate_files = ["src/agent.py"]
+
+                # Filter out tasks that are likely to fail due to missing dependencies or paths
+                valid_stories = []
+                for story in to_enqueue:
+                    story_desc = story.get('description', '').lower()
+                    # Skip tasks that require non-existent file paths
+                    if any(path in story_desc for path in ['apps/backend', 'alembic', 'fastapi', 'sqlalchemy']):
+                        logger.warning(f"Skipping potentially problematic story: {story_desc[:50]}...")
+                        continue
+                    valid_stories.append(story)
+
+                if not valid_stories:
+                    logger.warning("All stories filtered out due to potential issues - consulting CEO Strategist")
                     return None
-                else:
-                    candidate_files = [
-                        f.filename for f in self.project_state.living_blueprint.root if f.filename.endswith(".py")
-                    ]
-                    if not candidate_files:
-                        candidate_files = ["src/agent.py"]
 
-                    for story in to_enqueue:
-                        # Round-robin file assignment to spread work and avoid churn
-                        idx = self.project_state.file_rotation_idx % len(candidate_files)
-                        target_file = candidate_files[idx]
-                        self.project_state.file_rotation_idx += 1
+                for story in valid_stories:
+                    # Round-robin file assignment to spread work and avoid churn
+                    idx = self.project_state.file_rotation_idx % len(candidate_files)
+                    target_file = candidate_files[idx]
+                    self.project_state.file_rotation_idx += 1
 
-                        # Check if this task was recently completed to avoid duplicates
-                        story_desc = story.get('description', 'Story')
-                        task_desc = f"Implement user story: {story_desc} in {target_file}"
-                        recent_tasks = self.project_state.completed_tasks[-10:]  # Check last 10 tasks
+                    # Check if this task was recently completed to avoid duplicates
+                    story_desc = story.get('description', 'Story')
+                    task_desc = f"Implement user story: {story_desc} in {target_file}"
+                    recent_tasks = self.project_state.completed_tasks[-10:]  # Check last 10 tasks
 
-                        if any(task_desc in recent_task or recent_task in task_desc for recent_task in recent_tasks):
-                            logger.info(f"Skipping duplicate task: {task_desc}")
-                            continue
+                    if any(task_desc in recent_task or recent_task in task_desc for recent_task in recent_tasks):
+                        logger.info(f"Skipping duplicate task: {task_desc}")
+                        continue
 
-                        # Also check for recently completed diversify tasks to avoid immediate re-diversification
-                        diversify_task_desc = f"Diversify focus: implement story part in {target_file}"
-                        if any(diversify_task_desc in recent_task for recent_task in recent_tasks):
-                            logger.info(f"Skipping task - recently completed diversify task for {target_file}: {task_desc}")
-                            continue
+                    # Also check for recently completed diversify tasks to avoid immediate re-diversification
+                    diversify_task_desc = f"Diversify focus: implement story part in {target_file}"
+                    if any(diversify_task_desc in recent_task for recent_task in recent_tasks):
+                        logger.info(f"Skipping task - recently completed diversify task for {target_file}: {task_desc}")
+                        continue
 
-                        # Prioritize tasks that create missing files (breadth-first)
-                        if target_file not in self.assembler.get_all_files():
-                            self.project_state.task_queue.insert(
-                                0,
-                                {
-                                    "task_type": TaskType.TDD_IMPLEMENTATION.value,
-                                    "task_description": f"Create and implement: {story_desc} in {target_file}",
-                                    "details": {
-                                        "target_file": target_file,
-                                        "acceptance_criteria": story.get("acceptance_criteria", []),
-                                        "story_points": story.get("story_points", 1),
-                                    },
-                                },
-                            )
-                            continue
-                        self.project_state.task_queue.append(
+                    # Prioritize tasks that create missing files (breadth-first)
+                    if target_file not in self.assembler.get_all_files():
+                        self.project_state.task_queue.insert(
+                            0,
                             {
                                 "task_type": TaskType.TDD_IMPLEMENTATION.value,
-                                "task_description": task_desc,
+                                "task_description": f"Create and implement: {story_desc} in {target_file}",
                                 "details": {
                                     "target_file": target_file,
                                     "acceptance_criteria": story.get("acceptance_criteria", []),
                                     "story_points": story.get("story_points", 1),
                                 },
-                            }
+                            },
                         )
+                        continue
+                    self.project_state.task_queue.append(
+                        {
+                            "task_type": TaskType.TDD_IMPLEMENTATION.value,
+                            "task_description": task_desc,
+                            "details": {
+                                "target_file": target_file,
+                                "acceptance_criteria": story.get("acceptance_criteria", []),
+                                "story_points": story.get("story_points", 1),
+                            },
+                        }
+                    )
 
             if self.project_state.task_queue:
                 return self.project_state.task_queue.pop(0)
@@ -5411,21 +5495,66 @@ Backend: http://localhost:8000/health
             else:
                 logger.warning("Goal not achieved but no tasks available. This might be a planning issue.")
 
+                # Try to generate a simple fallback task
+                logger.info("Attempting to generate fallback task...")
+                available_files = [f.filename for f in self.project_state.living_blueprint.root if f.filename.endswith(".py")]
+                if not available_files:
+                    available_files = ["main.py"]
+
+                fallback_task = {
+                    "task_type": TaskType.TDD_IMPLEMENTATION.value,
+                    "task_description": f"Create basic implementation for {self.project_state.goal[:50]}...",
+                    "details": {
+                        "target_file": available_files[0],
+                        "acceptance_criteria": ["Basic functionality implemented"],
+                        "story_points": 1,
+                    },
+                }
+
+                logger.info(f"Generated fallback task: {fallback_task['task_description']}")
+                return fallback_task
+
         query_text_for_ceo = (
             json.dumps(self.project_state.goal)
             if isinstance(self.project_state.goal, dict)
             else self.project_state.goal
         )
-        next_task = await self.ai.ceo_strategist(
-            query_text_for_ceo,
-            self.project_state.completed_tasks,
-            self.assembler.get_all_files(),
-            self.project_state,
-            last_task_result,
-            cognitive_state=self.project_state.cognitive_state,
-            dev_strategy=self.project_state.development_strategy,
-        )
-        return next_task
+        try:
+            next_task = await self.ai.ceo_strategist(
+                query_text_for_ceo,
+                self.project_state.completed_tasks,
+                self.assembler.get_all_files(),
+                self.project_state,
+                last_task_result,
+                cognitive_state=self.project_state.cognitive_state,
+                dev_strategy=self.project_state.development_strategy,
+            )
+
+            # Validate the returned task
+            if next_task and isinstance(next_task, dict) and next_task.get("task_type"):
+                logger.info(f"CEO Strategist generated task: {next_task.get('task_description', 'Unknown')}")
+                return next_task
+            else:
+                logger.warning("CEO Strategist returned invalid task. Generating fallback task.")
+                # Return the fallback task we prepared earlier
+                return fallback_task if 'fallback_task' in locals() else None
+
+        except Exception as e:
+            logger.error(f"Error consulting CEO Strategist: {e}")
+            # Return a simple fallback task
+            available_files = [f.filename for f in self.project_state.living_blueprint.root if f.filename.endswith(".py")]
+            if not available_files:
+                available_files = ["main.py"]
+
+            return {
+                "task_type": TaskType.TDD_IMPLEMENTATION.value,
+                "task_description": f"Implement core functionality for {self.project_state.goal[:50]}...",
+                "details": {
+                    "target_file": available_files[0],
+                    "acceptance_criteria": ["Core functionality implemented"],
+                    "story_points": 1,
+                },
+            }
 
     async def check_goal_achievement(self, last_task_result: str) -> bool:
         """Check if the goal has been achieved based on completed tasks and results"""
@@ -5790,7 +5919,10 @@ Backend: http://localhost:8000/health
                 stories_sorted = sorted(stories, key=lambda x: x.get('story_points', 1))
                 new_sprint_items = stories_sorted[:sprint_backlog_size]
 
-                # Add to existing sprint backlog
+                # Add to existing sprint backlog with timestamps
+                current_time = time.time()
+                for story in new_sprint_items:
+                    story['added_at'] = current_time
                 self.project_state.sprint_backlog.extend(new_sprint_items)
 
                 # Update current epic index if we completed all stories for current epic
